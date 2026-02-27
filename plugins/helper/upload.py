@@ -538,19 +538,34 @@ async def fetch_ytdlp_formats(url: str) -> dict:
                 available = {}
                 for f in formats:
                     height = f.get("height")
+                    width = f.get("width")
                     
-                    # Facebook Missing Qualities Fix: HD/SD streams have height=None
-                    if height is None:
-                        fid = str(f.get("format_id", "")).lower()
-                        if fid == "hd":
-                            height = 720
-                        elif fid == "sd":
-                            height = 360
+                    # 1. Facebook/Generic: If height is missing, try to parse from 'resolution' or 'format_id'
+                    if not height:
+                        res_str = f.get("resolution") or ""
+                        match = re.search(r'(\d+)x(\d+)', res_str)
+                        if match:
+                            width = int(match.group(1))
+                            height = int(match.group(2))
+                        else:
+                            # Fallback to common Facebook identifiers
+                            fid = str(f.get("format_id", "")).lower()
+                            if fid == "hd": height = 720
+                            elif fid == "sd": height = 360
+                            elif "1080" in fid: height = 1080
+                            elif "720" in fid: height = 720
+                            elif "480" in fid: height = 480
+                            elif "360" in fid: height = 360
                     
                     if height and f.get("vcodec") != "none":
-                        res = f"{height}p"
-                        # yt-dlp returns formats sorted from worst to best.
-                        # Overwriting the key guarantees we keep the best format for this resolution
+                        # For vertical videos, the height might be 1920 (width 1080).
+                        # We still report it as 1080p to match standard naming.
+                        label_height = height
+                        if width and height > width and height >= 640:
+                            # Vertical video: use width as the primary resolution label (e.g. 1080p instead of 1920p)
+                            label_height = width
+                        
+                        res = f"{label_height}p"
                         available[res] = f
                 
                 results = []
@@ -742,10 +757,7 @@ async def download_ytdlp(
     ydl_opts = {
         "format": fmt,
         "format_sort": [
-            "res",        # Prefer highest resolution (absolute best)
-            "vbr",        # Prefer highest video bitrate
-            "tbr",        # Prefer highest total bitrate
-            "fps",        # Prefer highest frame rate
+            "res", "vbr", "tbr", "fps", "size"
         ],
         "outtmpl": outtmpl,
         "progress_hooks": [_progress_hook],
@@ -772,6 +784,8 @@ async def download_ytdlp(
             },
         }
     }
+
+    Config.LOGGER.info(f"Downloading with format string: {fmt}")
 
     # Additional logic for NSFW/Blocked sites
     if "pornhub.com" in url.lower():
