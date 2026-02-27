@@ -293,9 +293,6 @@ async def fetch_ytdlp_title(url: str) -> str | None:
                     "youtube": {
                         "player_client": ["web", "creator"],
                     },
-                    "youtubepot-bgutilhttp": {
-                        "base_url": ["http://localhost:4416"],
-                    }
                 }
             }
             if Config.COOKIES_FILE and os.path.exists(Config.COOKIES_FILE):
@@ -479,9 +476,6 @@ async def fetch_ytdlp_formats(url: str) -> dict:
                     "youtube": {
                         "player_client": ["web", "creator"],
                     },
-                    "youtubepot-bgutilhttp": {
-                        "base_url": ["http://localhost:4416"],
-                    }
                 }
             }
 
@@ -758,9 +752,6 @@ async def download_ytdlp(
             "youtube": {
                 "player_client": ["web", "creator"],
             },
-            "youtubepot-bgutilhttp": {
-                "base_url": ["http://localhost:4416"],
-            }
         }
     }
 
