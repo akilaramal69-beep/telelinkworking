@@ -537,36 +537,49 @@ async def fetch_ytdlp_formats(url: str) -> dict:
                 # Filter for useful formats
                 available = {}
                 for f in formats:
-                    height = f.get("height")
-                    width = f.get("width")
+                    # Robust dimension extraction
+                    w = f.get("width") or 0
+                    h = f.get("height") or 0
                     
-                    # 1. Facebook/Generic: If height is missing, try to parse from 'resolution' or 'format_id'
-                    if not height:
-                        res_str = f.get("resolution") or ""
-                        match = re.search(r'(\d+)x(\d+)', res_str)
-                        if match:
-                            width = int(match.group(1))
-                            height = int(match.group(2))
-                        else:
-                            # Fallback to common Facebook identifiers
-                            fid = str(f.get("format_id", "")).lower()
-                            if fid == "hd": height = 720
-                            elif fid == "sd": height = 360
-                            elif "1080" in fid: height = 1080
-                            elif "720" in fid: height = 720
-                            elif "480" in fid: height = 480
-                            elif "360" in fid: height = 360
+                    # Try to parse from resolution string if missing
+                    if not (w and h):
+                        res_str = f.get("resolution") or f.get("format_id") or ""
+                        m = re.search(r'(\d+)x(\d+)', res_str)
+                        if m:
+                            w = w or int(m.group(1))
+                            h = h or int(m.group(2))
                     
-                    if height and f.get("vcodec") != "none":
-                        # For vertical videos, the height might be 1920 (width 1080).
-                        # We still report it as 1080p to match standard naming.
-                        label_height = height
-                        if width and height > width and height >= 640:
-                            # Vertical video: use width as the primary resolution label (e.g. 1080p instead of 1920p)
-                            label_height = width
+                    # Special handling for legacy Facebook format identifiers
+                    if not h:
+                        fid = str(f.get("format_id", "")).lower()
+                        if fid == "hd": h = 720
+                        elif fid == "sd": h = 360
+                        elif "1080" in fid: h = 1080
+                        elif "720" in fid: h = 720
+                        elif "480" in fid: h = 480
+                        elif "360" in fid: h = 360
+                    
+                    if h and f.get("vcodec") != "none":
+                        # Normalization: Use the smaller dimension as the resolution label (e.g. 1080p for 1080x1920)
+                        # but only if both dimensions are known. Otherwise fallback to height.
+                        label_res = min(w, h) if (w and h) else h
+                        res_key = f"{label_res}p"
                         
-                        res = f"{label_height}p"
-                        available[res] = f
+                        # Bitrate Priority: Keep the format with the highest bitrate for this resolution
+                        if res_key not in available:
+                            available[res_key] = f
+                        else:
+                            curr_f = available[res_key]
+                            curr_rate = curr_f.get("tbr") or curr_f.get("vbr") or 0
+                            new_rate = f.get("tbr") or f.get("vbr") or 0
+                            
+                            # Also consider filesize if bitrate is missing
+                            if not (curr_rate or new_rate):
+                                curr_rate = curr_f.get("filesize") or curr_f.get("filesize_approx") or 0
+                                new_rate = f.get("filesize") or f.get("filesize_approx") or 0
+                                
+                            if new_rate >= curr_rate:
+                                available[res_key] = f
                 
                 results = []
                 sorted_res = sorted(
