@@ -78,6 +78,46 @@ def needs_ffmpeg_download(url: str, mime: str) -> bool:
     ext = os.path.splitext(urllib.parse.urlparse(url).path)[1].lower()
     return ext in STREAMING_EXTENSIONS or (mime or "").lower() in HLS_MIME_TYPES
 
+async def probe_file_size(url: str) -> int | None:
+    """Aggressively probe for file size using HEAD and Range GET fallback."""
+    session = await get_http_session()
+    # 1. Try HEAD first
+    try:
+        async with session.head(
+            url, allow_redirects=True, 
+            timeout=aiohttp.ClientTimeout(total=8),
+            proxy=Config.PROXY
+        ) as head:
+            cl = head.headers.get("Content-Length")
+            if cl and cl.isdigit():
+                return int(cl)
+    except Exception:
+        pass
+        
+    # 2. Try GET with Range: bytes=0-0 (Fallback for servers blocking HEAD)
+    try:
+        headers = {"Range": "bytes=0-0"}
+        async with session.get(
+            url, allow_redirects=True,
+            headers=headers,
+            timeout=aiohttp.ClientTimeout(total=8),
+            proxy=Config.PROXY
+        ) as resp:
+            # Look at Content-Range header: bytes 0-0/TOTAL_SIZE
+            cr = resp.headers.get("Content-Range")
+            if cr and "/" in cr:
+                total = cr.split("/")[-1]
+                if total.isdigit():
+                    return int(total)
+            # Some servers might ignore Range and return 200 with whole file length
+            cl = resp.headers.get("Content-Length")
+            if cl and cl.isdigit():
+                return int(cl)
+    except Exception:
+        pass
+    return None
+
+
 async def resolve_url(url: str) -> str:
     """Resolve redirecting URLs (like reddit shortlinks) and bypass Twitter NSFW blocks."""
     # 1. Resolve Reddit short links
@@ -441,20 +481,9 @@ async def fetch_ytdlp_formats(url: str) -> dict:
 
             if format_results:
                 # ── Final safety probe for missing YouTube filesizes ─────────────────
-                session = await get_http_session()
                 for f_dict in format_results:
                     if f_dict.get("filesize") is None and f_dict.get("url"):
-                        try:
-                            async with session.head(
-                                f_dict["url"], allow_redirects=True, 
-                                timeout=aiohttp.ClientTimeout(total=5),
-                                proxy=Config.PROXY
-                            ) as head:
-                                cl = head.headers.get("Content-Length")
-                                if cl and cl.isdigit():
-                                    f_dict["filesize"] = int(cl)
-                        except Exception:
-                            pass
+                        f_dict["filesize"] = await probe_file_size(f_dict["url"])
                     # Remove temporary URL before sending to client
                     if "url" in f_dict:
                         del f_dict["url"]
@@ -569,20 +598,9 @@ async def fetch_ytdlp_formats(url: str) -> dict:
     if res and res.get("formats"):
         session = await get_http_session()
         for f_dict in res["formats"]:
-            # If still None (estimation failed) and we have a direct stream URL, try HEAD
+            # If still None (estimation failed) and we have a direct stream URL, try aggressive probe
             if f_dict.get("filesize") is None and f_dict.get("url"):
-                try:
-                    # Short timeout to avoid blocking UI
-                    async with session.head(
-                        f_dict["url"], allow_redirects=True, 
-                        timeout=aiohttp.ClientTimeout(total=5),
-                        proxy=Config.PROXY
-                    ) as head:
-                        cl = head.headers.get("Content-Length")
-                        if cl and cl.isdigit():
-                            f_dict["filesize"] = int(cl)
-                except Exception:
-                    pass
+                f_dict["filesize"] = await probe_file_size(f_dict["url"])
             
             # Remove temporary URL before sending to client
             if "url" in f_dict:
