@@ -333,9 +333,6 @@ async def fetch_ytdlp_title(url: str) -> str | None:
                     "youtube": {
                         "player_client": ["web", "creator"],
                     },
-                    "youtubepot-bgutilhttp": {
-                        "base_url": ["http://localhost:4416"],
-                    }
                 }
             }
             if Config.COOKIES_FILE and os.path.exists(Config.COOKIES_FILE):
@@ -484,20 +481,9 @@ async def fetch_ytdlp_formats(url: str) -> dict:
 
             if format_results:
                 # ── Final safety probe for missing YouTube filesizes ─────────────────
-                session = await get_http_session()
                 for f_dict in format_results:
                     if f_dict.get("filesize") is None and f_dict.get("url"):
-                        try:
-                            async with session.head(
-                                f_dict["url"], allow_redirects=True, 
-                                timeout=aiohttp.ClientTimeout(total=5),
-                                proxy=Config.PROXY
-                            ) as head:
-                                cl = head.headers.get("Content-Length")
-                                if cl and cl.isdigit():
-                                    f_dict["filesize"] = int(cl)
-                        except Exception:
-                            pass
+                        f_dict["filesize"] = await probe_file_size(f_dict["url"])
                     # Remove temporary URL before sending to client
                     if "url" in f_dict:
                         del f_dict["url"]
@@ -513,13 +499,15 @@ async def fetch_ytdlp_formats(url: str) -> dict:
                 "no_warnings": True,
                 "format_sort": ["res", "vbr", "tbr", "fps"],
                 "force_ipv4": True,
-                "nocheckcertificate": True,
+                "nocheckcertificate": True, # Ignore SSL artifacts
                 "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
                 "extractor_args": {
-                    "youtube": {"player_client": ["web", "creator"]},
-                    "youtubepot-bgutilhttp": {"base_url": ["http://localhost:4416"]}
+                    "youtube": {
+                        "player_client": ["web", "creator"],
+                    },
                 }
             }
+
 
             if Config.COOKIES_FILE and os.path.exists(Config.COOKIES_FILE):
                 opts["cookiefile"] = Config.COOKIES_FILE
@@ -538,7 +526,7 @@ async def fetch_ytdlp_formats(url: str) -> dict:
                 formats = info.get("formats", [])
                 title = info.get("title", "video")
                 
-                # 1. Calculate best audio size for estimation
+                # Find the best audio size to add to video-only stream sizes
                 best_audio_size = 0
                 for f in formats:
                     if f.get("vcodec") == "none" and f.get("acodec") != "none":
@@ -546,17 +534,14 @@ async def fetch_ytdlp_formats(url: str) -> dict:
                         if size > best_audio_size:
                             best_audio_size = size
 
-                # 2. Extract and normalize video formats
+                # Filter for useful formats
                 available = {}
                 for f in formats:
-                    if f.get("vcodec") == "none":
-                        continue
-                        
-                    # Extract dimensions
+                    # Robust dimension extraction
                     w = f.get("width") or 0
                     h = f.get("height") or 0
                     
-                    # Parse from resolution string fallback
+                    # Try to parse from resolution string if missing
                     if not (w and h):
                         res_str = f.get("resolution") or f.get("format_id") or ""
                         m = re.search(r'(\d+)x(\d+)', res_str)
@@ -564,7 +549,7 @@ async def fetch_ytdlp_formats(url: str) -> dict:
                             w = w or int(m.group(1))
                             h = h or int(m.group(2))
                     
-                    # Handle legacy Facebook tags
+                    # Special handling for legacy Facebook format identifiers
                     if not h:
                         fid = str(f.get("format_id", "")).lower()
                         if fid == "hd": h = 720
@@ -574,34 +559,28 @@ async def fetch_ytdlp_formats(url: str) -> dict:
                         elif "480" in fid: h = 480
                         elif "360" in fid: h = 360
                     
-                    if h:
-                        # Resolution Label: Use min(w, h) for vertical videos (e.g. 1080x1920 -> 1080p)
+                    if h and f.get("vcodec") != "none":
+                        # Normalization: Use the smaller dimension as the resolution label (e.g. 1080p for 1080x1920)
+                        # but only if both dimensions are known. Otherwise fallback to height.
                         label_res = min(w, h) if (w and h) else h
                         res_key = f"{label_res}p"
                         
-                        # Selection Strategy:
-                        # a. Prefer formats WITH audio (merged) to reduce post-download issues.
-                        # b. Pick higher bitrate between similar candidates.
+                        # Bitrate Priority: Keep the format with the highest bitrate for this resolution
                         if res_key not in available:
                             available[res_key] = f
                         else:
                             curr_f = available[res_key]
-                            curr_has_audio = curr_f.get("acodec") != "none"
-                            new_has_audio = f.get("acodec") != "none"
+                            curr_rate = curr_f.get("tbr") or curr_f.get("vbr") or 0
+                            new_rate = f.get("tbr") or f.get("vbr") or 0
                             
-                            # Audio priority
-                            if new_has_audio and not curr_has_audio:
+                            # Also consider filesize if bitrate is missing
+                            if not (curr_rate or new_rate):
+                                curr_rate = curr_f.get("filesize") or curr_f.get("filesize_approx") or 0
+                                new_rate = f.get("filesize") or f.get("filesize_approx") or 0
+                                
+                            if new_rate >= curr_rate:
                                 available[res_key] = f
-                            elif not new_has_audio and curr_has_audio:
-                                continue
-                            else:
-                                # Both same: Bitrate priority
-                                curr_rate = curr_f.get("tbr") or curr_f.get("vbr") or 0
-                                new_rate = f.get("tbr") or f.get("vbr") or 0
-                                if new_rate >= curr_rate:
-                                    available[res_key] = f
                 
-                # 3. Build result list
                 results = []
                 sorted_res = sorted(
                     available.keys(), 
@@ -613,14 +592,14 @@ async def fetch_ytdlp_formats(url: str) -> dict:
                     f = available[res]
                     size = f.get("filesize") or f.get("filesize_approx")
                     
-                    # Estimation
+                    # Estimate size if missing using bitrate and duration
                     if size is None:
                         tbr = f.get("tbr")
                         duration = info.get("duration")
                         if tbr and duration:
                             size = int((tbr * 1024 / 8) * duration)
 
-                    # Add audio if video-only
+                    # Add audio size only if we have a base video size and it lacks audio
                     if f.get("acodec") == "none" and size is not None and best_audio_size > 0:
                         size += best_audio_size
                         
@@ -632,6 +611,10 @@ async def fetch_ytdlp_formats(url: str) -> dict:
                         "url": f.get("url")
                     })
                 
+                # If we only found 0 formats, we return empty list so the bot skips selection
+                if len(results) < 1:
+                    return {"formats": [], "title": title}
+                    
                 return {"formats": results, "title": title}
         except Exception as e:
             Config.LOGGER.error(f"Error fetching formats for {url}: {e}")
@@ -643,8 +626,10 @@ async def fetch_ytdlp_formats(url: str) -> dict:
     if res and res.get("formats"):
         session = await get_http_session()
         for f_dict in res["formats"]:
+            # If still None (estimation failed) and we have a direct stream URL, try aggressive probe
             if f_dict.get("filesize") is None and f_dict.get("url"):
                 f_dict["filesize"] = await probe_file_size(f_dict["url"])
+            
             # Remove temporary URL before sending to client
             if "url" in f_dict:
                 del f_dict["url"]
@@ -810,11 +795,10 @@ async def download_ytdlp(
             "youtube": {
                 "player_client": ["web", "creator"],
             },
-            "youtubepot-bgutilhttp": {
-                "base_url": ["http://localhost:4416"],
-            }
         }
     }
+
+    Config.LOGGER.info(f"Downloading with format string: {fmt}")
 
     # Additional logic for NSFW/Blocked sites
     if "pornhub.com" in url.lower():
