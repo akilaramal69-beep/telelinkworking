@@ -34,7 +34,7 @@ class Config:
     # ── File handling ─────────────────────────────────
     DOWNLOAD_LOCATION: str = os.path.abspath("./DOWNLOADS")
     MAX_FILE_SIZE: int = 2_097_152_000          # ~2 GB (Pyrogram MTProto limit)
-    CHUNK_SIZE: int = int(os.environ.get("CHUNK_SIZE", 10240)) * 1024  # KB → bytes (Default: 10MB per chunk for faster HTTP processing)
+    CHUNK_SIZE: int = int(os.environ.get("CHUNK_SIZE", 4096)) * 1024  # KB → bytes (Default: 4MB per chunk for faster HTTP processing)
 
     # ── Misc ──────────────────────────────────────────
     LOGGER = logging

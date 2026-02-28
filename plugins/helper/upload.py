@@ -78,46 +78,6 @@ def needs_ffmpeg_download(url: str, mime: str) -> bool:
     ext = os.path.splitext(urllib.parse.urlparse(url).path)[1].lower()
     return ext in STREAMING_EXTENSIONS or (mime or "").lower() in HLS_MIME_TYPES
 
-async def probe_file_size(url: str) -> int | None:
-    """Aggressively probe for file size using HEAD and Range GET fallback."""
-    session = await get_http_session()
-    # 1. Try HEAD first
-    try:
-        async with session.head(
-            url, allow_redirects=True, 
-            timeout=aiohttp.ClientTimeout(total=8),
-            proxy=Config.PROXY
-        ) as head:
-            cl = head.headers.get("Content-Length")
-            if cl and cl.isdigit():
-                return int(cl)
-    except Exception:
-        pass
-        
-    # 2. Try GET with Range: bytes=0-0 (Fallback for servers blocking HEAD)
-    try:
-        headers = {"Range": "bytes=0-0"}
-        async with session.get(
-            url, allow_redirects=True,
-            headers=headers,
-            timeout=aiohttp.ClientTimeout(total=8),
-            proxy=Config.PROXY
-        ) as resp:
-            # Look at Content-Range header: bytes 0-0/TOTAL_SIZE
-            cr = resp.headers.get("Content-Range")
-            if cr and "/" in cr:
-                total = cr.split("/")[-1]
-                if total.isdigit():
-                    return int(total)
-            # Some servers might ignore Range and return 200 with whole file length
-            cl = resp.headers.get("Content-Length")
-            if cl and cl.isdigit():
-                return int(cl)
-    except Exception:
-        pass
-    return None
-
-
 async def resolve_url(url: str) -> str:
     """Resolve redirecting URLs (like reddit shortlinks) and bypass Twitter NSFW blocks."""
     # 1. Resolve Reddit short links
@@ -333,6 +293,9 @@ async def fetch_ytdlp_title(url: str) -> str | None:
                     "youtube": {
                         "player_client": ["web", "creator"],
                     },
+                    "youtubepot-bgutilhttp": {
+                        "base_url": ["http://localhost:4416"],
+                    }
                 }
             }
             if Config.COOKIES_FILE and os.path.exists(Config.COOKIES_FILE):
@@ -481,9 +444,20 @@ async def fetch_ytdlp_formats(url: str) -> dict:
 
             if format_results:
                 # ── Final safety probe for missing YouTube filesizes ─────────────────
+                session = await get_http_session()
                 for f_dict in format_results:
                     if f_dict.get("filesize") is None and f_dict.get("url"):
-                        f_dict["filesize"] = await probe_file_size(f_dict["url"])
+                        try:
+                            async with session.head(
+                                f_dict["url"], allow_redirects=True, 
+                                timeout=aiohttp.ClientTimeout(total=5),
+                                proxy=Config.PROXY
+                            ) as head:
+                                cl = head.headers.get("Content-Length")
+                                if cl and cl.isdigit():
+                                    f_dict["filesize"] = int(cl)
+                        except Exception:
+                            pass
                     # Remove temporary URL before sending to client
                     if "url" in f_dict:
                         del f_dict["url"]
@@ -505,6 +479,9 @@ async def fetch_ytdlp_formats(url: str) -> dict:
                     "youtube": {
                         "player_client": ["web", "creator"],
                     },
+                    "youtubepot-bgutilhttp": {
+                        "base_url": ["http://localhost:4416"],
+                    }
                 }
             }
 
@@ -537,67 +514,21 @@ async def fetch_ytdlp_formats(url: str) -> dict:
                 # Filter for useful formats
                 available = {}
                 for f in formats:
-                    # Robust dimension extraction
-                    w = f.get("width") or 0
-                    h = f.get("height") or 0
+                    height = f.get("height")
                     
-                    # Try to parse from resolution string if missing
-                    if not (w and h):
-                        res_str = f.get("resolution") or f.get("format_id") or ""
-                        m = re.search(r'(\d+)x(\d+)', res_str)
-                        if m:
-                            w = w or int(m.group(1))
-                            h = h or int(m.group(2))
-                    
-                    # Special handling for legacy Facebook format identifiers
-                    if not h:
+                    # Facebook Missing Qualities Fix: HD/SD streams have height=None
+                    if height is None:
                         fid = str(f.get("format_id", "")).lower()
-                        if fid == "hd": h = 720
-                        elif fid == "sd": h = 360
-                        elif "1080" in fid: h = 1080
-                        elif "720" in fid: h = 720
-                        elif "480" in fid: h = 480
-                        elif "360" in fid: h = 360
+                        if fid == "hd":
+                            height = 720
+                        elif fid == "sd":
+                            height = 360
                     
-                    if h and f.get("vcodec") != "none":
-                        # If FFmpeg is missing, we must NOT allow video-only DASH streams
-                        # as they will result in silent videos.
-                        has_audio = f.get("acodec") != "none"
-                        # We use a sync check here as we are inside a thread (executor)
-                        ffmpeg_path_found = shutil.which(_get_ffmpeg_bin())
-                        
-                        if not has_audio and not ffmpeg_path_found:
-                            continue
-
-                        # Normalization: Use the smaller dimension as the resolution label
-                        label_res = min(w, h) if (w and h) else h
-                        res_key = f"{label_res}p"
-                        
-                        # Bitrate Priority: Keep the format with the highest bitrate for this resolution
-                        if res_key not in available:
-                            available[res_key] = f
-                        else:
-                            curr_f = available[res_key]
-                            curr_has_audio = curr_f.get("acodec") != "none"
-                            new_has_audio = f.get("acodec") != "none"
-                            
-                            # 1. Prefer formats with audio (reducing merge failures)
-                            if new_has_audio and not curr_has_audio:
-                                available[res_key] = f
-                                continue
-                            elif curr_has_audio and not new_has_audio:
-                                continue
-                                
-                            # 2. Both have or both lack audio: pick by bitrate
-                            curr_rate = curr_f.get("tbr") or curr_f.get("vbr") or 0
-                            new_rate = f.get("tbr") or f.get("vbr") or 0
-                            
-                            if not (curr_rate or new_rate):
-                                curr_rate = curr_f.get("filesize") or curr_f.get("filesize_approx") or 0
-                                new_rate = f.get("filesize") or f.get("filesize_approx") or 0
-                                
-                            if new_rate >= curr_rate:
-                                available[res_key] = f
+                    if height and f.get("vcodec") != "none":
+                        res = f"{height}p"
+                        # yt-dlp returns formats sorted from worst to best.
+                        # Overwriting the key guarantees we keep the best format for this resolution
+                        available[res] = f
                 
                 results = []
                 sorted_res = sorted(
@@ -644,9 +575,20 @@ async def fetch_ytdlp_formats(url: str) -> dict:
     if res and res.get("formats"):
         session = await get_http_session()
         for f_dict in res["formats"]:
-            # If still None (estimation failed) and we have a direct stream URL, try aggressive probe
+            # If still None (estimation failed) and we have a direct stream URL, try HEAD
             if f_dict.get("filesize") is None and f_dict.get("url"):
-                f_dict["filesize"] = await probe_file_size(f_dict["url"])
+                try:
+                    # Short timeout to avoid blocking UI
+                    async with session.head(
+                        f_dict["url"], allow_redirects=True, 
+                        timeout=aiohttp.ClientTimeout(total=5),
+                        proxy=Config.PROXY
+                    ) as head:
+                        cl = head.headers.get("Content-Length")
+                        if cl and cl.isdigit():
+                            f_dict["filesize"] = int(cl)
+                except Exception:
+                    pass
             
             # Remove temporary URL before sending to client
             if "url" in f_dict:
@@ -788,7 +730,10 @@ async def download_ytdlp(
     ydl_opts = {
         "format": fmt,
         "format_sort": [
-            "res", "vbr", "tbr", "fps", "size"
+            "res",        # Prefer highest resolution (absolute best)
+            "vbr",        # Prefer highest video bitrate
+            "tbr",        # Prefer highest total bitrate
+            "fps",        # Prefer highest frame rate
         ],
         "outtmpl": outtmpl,
         "progress_hooks": [_progress_hook],
@@ -813,10 +758,11 @@ async def download_ytdlp(
             "youtube": {
                 "player_client": ["web", "creator"],
             },
+            "youtubepot-bgutilhttp": {
+                "base_url": ["http://localhost:4416"],
+            }
         }
     }
-
-    Config.LOGGER.info(f"Downloading with format string: {fmt}")
 
     # Additional logic for NSFW/Blocked sites
     if "pornhub.com" in url.lower():
