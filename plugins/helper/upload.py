@@ -263,25 +263,34 @@ def is_cobalt_url(url: str) -> bool:
 
 async def fetch_link_api(url: str) -> str | None:
     """
-    Call the link-api /grab endpoint to extract a direct download URL.
-    Uses headless Chromium + yt-dlp server-side to handle virtually any site.
+    Call the link-api GET /grab endpoint to extract a direct download URL.
+    Uses headless Chromium (Playwright) + yt-dlp server-side.
 
     Returns the best direct URL string, or None if unavailable / API is not configured.
     """
     if not Config.LINK_API_URL:
         return None
 
+    # Use GET with query params — simpler than POST and avoids any body encoding issues
+    params = {"url": url, "use_browser": "true", "timeout": "30"}
     api_url = Config.LINK_API_URL.rstrip("/") + "/grab"
     session = await get_http_session()
     try:
-        payload = {"url": url, "use_browser": True, "timeout": 30}
-        async with session.post(
+        async with session.get(
             api_url,
-            json=payload,
-            timeout=aiohttp.ClientTimeout(total=45),  # Chromium render can be slow
+            params=params,
+            timeout=aiohttp.ClientTimeout(total=50),  # Playwright render can be slow
         ) as resp:
             if resp.status != 200:
-                Config.LOGGER.warning(f"link-api returned HTTP {resp.status} for {url}")
+                # Log the detail body so we know WHY it failed
+                try:
+                    err_body = await resp.json()
+                    detail = err_body.get("detail", resp.reason)
+                except Exception:
+                    detail = await resp.text()
+                Config.LOGGER.warning(
+                    f"link-api returned HTTP {resp.status} for {url}: {detail}"
+                )
                 return None
 
             data = await resp.json()
@@ -289,11 +298,13 @@ async def fetch_link_api(url: str) -> str | None:
             # Prefer best_link from the API recommendation
             best = data.get("best_link")
             if best:
+                Config.LOGGER.info(f"link-api best_link: {best[:80]}")
                 return best
 
             # If no best_link, pick from links[] — prefer MP4 with audio+video at highest resolution
             links = data.get("links", [])
             if not links:
+                Config.LOGGER.warning(f"link-api returned 0 links for {url}")
                 return None
 
             def _score(link: dict) -> tuple:
@@ -303,7 +314,9 @@ async def fetch_link_api(url: str) -> str | None:
                 return (has_av, is_mp4, height)
 
             links_sorted = sorted(links, key=_score, reverse=True)
-            return links_sorted[0].get("url")
+            chosen = links_sorted[0].get("url")
+            Config.LOGGER.info(f"link-api chose: {str(chosen)[:80]}")
+            return chosen
 
     except Exception as e:
         Config.LOGGER.warning(f"link-api fetch failed for {url}: {e}")
