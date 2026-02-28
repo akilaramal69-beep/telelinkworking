@@ -32,6 +32,11 @@ def setup_po_token_server():
     Ensure the Node.js PO Token server dependencies are installed dynamically
     so we don't need to manually check-in node_modules to GitHub.
     """
+    import shutil
+    if not shutil.which("npm"):
+        print("⚠️ Warning: 'npm' not found. Skipping Node.js PO Token server setup.")
+        return None
+
     if not os.path.exists("package.json"):
         print("📦 Initializing package.json for PO Token server...")
         subprocess.run(["npm", "init", "-y"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)

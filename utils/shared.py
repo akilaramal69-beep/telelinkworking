@@ -28,10 +28,10 @@ async def get_http_session():
     global HTTP_SESSION
     if HTTP_SESSION is None or HTTP_SESSION.closed:
         import aiohttp
-        # Balanced limits: 500 total, 50 per host to prevent server bans
+        # Higher limits for aggressive concurrent file size probing
         connector = aiohttp.TCPConnector(
-            limit=500, 
-            limit_per_host=50,
+            limit=1000, 
+            limit_per_host=100,
             force_close=False, # Reuse connections
             enable_cleanup_closed=True
         )

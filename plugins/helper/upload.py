@@ -78,6 +78,46 @@ def needs_ffmpeg_download(url: str, mime: str) -> bool:
     ext = os.path.splitext(urllib.parse.urlparse(url).path)[1].lower()
     return ext in STREAMING_EXTENSIONS or (mime or "").lower() in HLS_MIME_TYPES
 
+async def probe_file_size(url: str) -> int | None:
+    """Aggressively probe for file size using HEAD and Range GET fallback."""
+    session = await get_http_session()
+    # 1. Try HEAD first
+    try:
+        async with session.head(
+            url, allow_redirects=True, 
+            timeout=aiohttp.ClientTimeout(total=8),
+            proxy=Config.PROXY
+        ) as head:
+            cl = head.headers.get("Content-Length")
+            if cl and cl.isdigit():
+                return int(cl)
+    except Exception:
+        pass
+        
+    # 2. Try GET with Range: bytes=0-0 (Fallback for servers blocking HEAD)
+    try:
+        headers = {"Range": "bytes=0-0"}
+        async with session.get(
+            url, allow_redirects=True,
+            headers=headers,
+            timeout=aiohttp.ClientTimeout(total=8),
+            proxy=Config.PROXY
+        ) as resp:
+            # Look at Content-Range header: bytes 0-0/TOTAL_SIZE
+            cr = resp.headers.get("Content-Range")
+            if cr and "/" in cr:
+                total = cr.split("/")[-1]
+                if total.isdigit():
+                    return int(total)
+            # Some servers might ignore Range and return 200 with whole file length
+            cl = resp.headers.get("Content-Length")
+            if cl and cl.isdigit():
+                return int(cl)
+    except Exception:
+        pass
+    return None
+
+
 async def resolve_url(url: str) -> str:
     """Resolve redirecting URLs (like reddit shortlinks) and bypass Twitter NSFW blocks."""
     # 1. Resolve Reddit short links
@@ -514,21 +554,57 @@ async def fetch_ytdlp_formats(url: str) -> dict:
                 # Filter for useful formats
                 available = {}
                 for f in formats:
-                    height = f.get("height")
+                    # Robust dimension extraction
+                    w = f.get("width") or 0
+                    h = f.get("height") or 0
                     
-                    # Facebook Missing Qualities Fix: HD/SD streams have height=None
-                    if height is None:
+                    # Try to parse from resolution string if missing
+                    if not (w and h):
+                        res_str = f.get("resolution") or f.get("format_id") or ""
+                        m = re.search(r'(\d+)x(\d+)', res_str)
+                        if m:
+                            w = w or int(m.group(1))
+                            h = h or int(m.group(2))
+                    
+                    # Special handling for legacy Facebook format identifiers
+                    if not h:
                         fid = str(f.get("format_id", "")).lower()
-                        if fid == "hd":
-                            height = 720
-                        elif fid == "sd":
-                            height = 360
+                        if fid == "hd": h = 720
+                        elif fid == "sd": h = 360
+                        elif "1080" in fid: h = 1080
+                        elif "720" in fid: h = 720
+                        elif "480" in fid: h = 480
+                        elif "360" in fid: h = 360
                     
-                    if height and f.get("vcodec") != "none":
-                        res = f"{height}p"
-                        # yt-dlp returns formats sorted from worst to best.
-                        # Overwriting the key guarantees we keep the best format for this resolution
-                        available[res] = f
+                    if h and f.get("vcodec") != "none":
+                        # Normalization: Use the smaller dimension as the resolution label (e.g. 1080p for 1080x1920)
+                        label_res = min(w, h) if (w and h) else h
+                        res_key = f"{label_res}p"
+                        
+                        # Bitrate & Audio Priority: 
+                        # 1. We prefer formats WITH audio (already merged) to reduce post-download failures.
+                        # 2. Between two formats, we pick the one with higher bitrate.
+                        if res_key not in available:
+                            available[res_key] = f
+                        else:
+                            curr_f = available[res_key]
+                            curr_has_audio = curr_f.get("acodec") != "none"
+                            new_has_audio = f.get("acodec") != "none"
+                            
+                            # Case 1: New has audio, old doesn't -> take new
+                            if new_has_audio and not curr_has_audio:
+                                available[res_key] = f
+                                continue
+                            # Case 2: New doesn't have audio, old does -> keep old
+                            elif not new_has_audio and curr_has_audio:
+                                continue
+                                
+                            # Case 3: Both have or both lack audio -> pick by bitrate
+                            curr_rate = curr_f.get("tbr") or curr_f.get("vbr") or 0
+                            new_rate = f.get("tbr") or f.get("vbr") or 0
+                            
+                            if new_rate >= curr_rate:
+                                available[res_key] = f
                 
                 results = []
                 sorted_res = sorted(
@@ -575,21 +651,8 @@ async def fetch_ytdlp_formats(url: str) -> dict:
     if res and res.get("formats"):
         session = await get_http_session()
         for f_dict in res["formats"]:
-            # If still None (estimation failed) and we have a direct stream URL, try HEAD
             if f_dict.get("filesize") is None and f_dict.get("url"):
-                try:
-                    # Short timeout to avoid blocking UI
-                    async with session.head(
-                        f_dict["url"], allow_redirects=True, 
-                        timeout=aiohttp.ClientTimeout(total=5),
-                        proxy=Config.PROXY
-                    ) as head:
-                        cl = head.headers.get("Content-Length")
-                        if cl and cl.isdigit():
-                            f_dict["filesize"] = int(cl)
-                except Exception:
-                    pass
-            
+                f_dict["filesize"] = await probe_file_size(f_dict["url"])
             # Remove temporary URL before sending to client
             if "url" in f_dict:
                 del f_dict["url"]
@@ -730,10 +793,7 @@ async def download_ytdlp(
     ydl_opts = {
         "format": fmt,
         "format_sort": [
-            "res",        # Prefer highest resolution (absolute best)
-            "vbr",        # Prefer highest video bitrate
-            "tbr",        # Prefer highest total bitrate
-            "fps",        # Prefer highest frame rate
+            "res", "vbr", "tbr", "fps", "size"
         ],
         "outtmpl": outtmpl,
         "progress_hooks": [_progress_hook],
