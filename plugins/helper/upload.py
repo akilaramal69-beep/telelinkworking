@@ -560,8 +560,16 @@ async def fetch_ytdlp_formats(url: str) -> dict:
                         elif "360" in fid: h = 360
                     
                     if h and f.get("vcodec") != "none":
-                        # Normalization: Use the smaller dimension as the resolution label (e.g. 1080p for 1080x1920)
-                        # but only if both dimensions are known. Otherwise fallback to height.
+                        # If FFmpeg is missing, we must NOT allow video-only DASH streams
+                        # as they will result in silent videos.
+                        has_audio = f.get("acodec") != "none"
+                        # We use a sync check here as we are inside a thread (executor)
+                        ffmpeg_path_found = shutil.which(_get_ffmpeg_bin())
+                        
+                        if not has_audio and not ffmpeg_path_found:
+                            continue
+
+                        # Normalization: Use the smaller dimension as the resolution label
                         label_res = min(w, h) if (w and h) else h
                         res_key = f"{label_res}p"
                         
@@ -570,10 +578,20 @@ async def fetch_ytdlp_formats(url: str) -> dict:
                             available[res_key] = f
                         else:
                             curr_f = available[res_key]
+                            curr_has_audio = curr_f.get("acodec") != "none"
+                            new_has_audio = f.get("acodec") != "none"
+                            
+                            # 1. Prefer formats with audio (reducing merge failures)
+                            if new_has_audio and not curr_has_audio:
+                                available[res_key] = f
+                                continue
+                            elif curr_has_audio and not new_has_audio:
+                                continue
+                                
+                            # 2. Both have or both lack audio: pick by bitrate
                             curr_rate = curr_f.get("tbr") or curr_f.get("vbr") or 0
                             new_rate = f.get("tbr") or f.get("vbr") or 0
                             
-                            # Also consider filesize if bitrate is missing
                             if not (curr_rate or new_rate):
                                 curr_rate = curr_f.get("filesize") or curr_f.get("filesize_approx") or 0
                                 new_rate = f.get("filesize") or f.get("filesize_approx") or 0
