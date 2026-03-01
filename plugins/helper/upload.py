@@ -1442,12 +1442,12 @@ async def download_url(url: str, filename: str, progress_msg, start_time_ref: li
                 try:
                     return await download_cobalt(url, filename, progress_msg, start_time_ref, user_id, cancel_ref=cancel_ref)
                 except Exception as cobalt_err:
-                    # cobalt also failed — try link-api as last resort
-                    Config.LOGGER.info("Cobalt failed, trying link-api as final fallback...")
+                    # cobalt also failed — try internal sniffer as last resort
+                    Config.LOGGER.info("Cobalt failed, trying internal sniffer as final fallback...")
                     try:
                         link_api_url = await fetch_link_api(url)
                         if link_api_url:
-                            Config.LOGGER.info(f"link-api resolved URL (fallback 1): {link_api_url[:80]}...")
+                            Config.LOGGER.info(f"Sniffer resolved URL (fallback 1): {link_api_url[:80]}...")
                             return await download_url(
                                 link_api_url, filename, progress_msg, start_time_ref, user_id, 
                                 format_id=format_id, cancel_ref=cancel_ref
@@ -1459,13 +1459,13 @@ async def download_url(url: str, filename: str, progress_msg, start_time_ref: li
                         f"Error 1 (yt-dlp): {ytdlp_err}\n\nError 2 (cobalt): {cobalt_err}"
                     ) from ytdlp_err
                 # yt-dlp failed and cobalt doesn't support this URL.
-                # Try link-api as a second attempt before giving up.
-                Config.LOGGER.info("yt-dlp failed, trying link-api as fallback...")
+                # Try internal sniffer as a second attempt before giving up.
+                Config.LOGGER.info("yt-dlp failed, trying internal sniffer as fallback...")
                 try:
                     # UPDATED: Use the /grab endpoint for a direct link if possible
                     link_api_url = await fetch_link_api(url)
                     if link_api_url:
-                        Config.LOGGER.info(f"link-api resolved URL (fallback 2): {link_api_url[:80]}...")
+                        Config.LOGGER.info(f"Sniffer resolved URL (fallback 2): {link_api_url[:80]}...")
                         # Recurse with the resolved direct URL
                         return await download_url(
                             link_api_url, filename, progress_msg, start_time_ref, user_id, 
@@ -1482,15 +1482,15 @@ async def download_url(url: str, filename: str, progress_msg, start_time_ref: li
         except Exception:
             pass # fall through to link-api / aria2c/http probe if cobalt fails
 
-    # ── Fallback B: link-api for unknown URLs ─────────────────────────────────
-    # For URLs that are not handled by yt-dlp or cobalt, try link-api to resolve
-    # the actual stream URL (headless browser + yt-dlp server-side).
-    if Config.LINK_API_URL:
+    # ── Fallback B: Internal Sniffer for unknown URLs ─────────────────────────
+    # For URLs that are not handled by yt-dlp or cobalt, try internal sniffer
+    # to resolve the actual stream URL (headless browser + yt-dlp server-side).
+    if True: # Always allow internal sniffer fallback for unknown URLs
         try:
-            Config.LOGGER.info(f"Trying link-api for unknown URL: {url[:80]}")
+            Config.LOGGER.info(f"Trying internal sniffer for unknown URL: {url[:80]}")
             link_api_url = await fetch_link_api(url)
             if link_api_url:
-                Config.LOGGER.info(f"link-api resolved: {link_api_url[:80]}...")
+                Config.LOGGER.info(f"Sniffer resolved: {link_api_url[:80]}...")
                 # Update progress and re-route to the resolved direct URL
                 await progress_msg.edit_text(
                     "📥 **Resolving stream…**\n_(grabbed direct link, downloading…)_",
@@ -1504,7 +1504,7 @@ async def download_url(url: str, filename: str, progress_msg, start_time_ref: li
         except asyncio.CancelledError:
             raise
         except Exception as link_e:
-            Config.LOGGER.warning(f"link-api fallback failed: {link_e}")
+            Config.LOGGER.warning(f"Sniffer fallback failed: {link_e}")
 
     # Transition state for WebApp
     WEBAPP_PROGRESS[user_id] = {
@@ -1522,9 +1522,19 @@ async def download_url(url: str, filename: str, progress_msg, start_time_ref: li
         timeout=aiohttp.ClientTimeout(total=30),
         proxy=Config.PROXY
     ) as head:
-        mime = head.headers.get("Content-Type", "").split(";")[0].strip()
+        mime = head.headers.get("Content-Type", "").lower().split(";")[0].strip()
         total_str = head.headers.get("Content-Length", "0")
         total = int(total_str) if total_str.isdigit() else 0
+        
+        # ── HTML GUARD: If it's a webpage, we CANNOT download it directly ──
+        if "text/html" in mime:
+             Config.LOGGER.info("Direct probe hit HTML. Attempting one last sniffer rescue...")
+             try:
+                 rescue_url = await fetch_link_api(url)
+                 if rescue_url and rescue_url != url:
+                      return await download_url(rescue_url, filename, progress_msg, start_time_ref, user_id, format_id, cancel_ref)
+             except: pass
+             raise ValueError("This URL is a webpage, not a direct media link. (Sniffer found nothing)")
         
         # Extract true filename if available from server
         cd = head.headers.get("Content-Disposition", "")
