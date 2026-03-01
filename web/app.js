@@ -54,7 +54,6 @@ initAds();
 let selectedFormat = null;
 let selectedMode = 'media';
 let currentFormats = [];
-let resolvedDirectUrl = null;  // When link-api extracts a direct URL
 
 function showError(msg) {
     errorMsg.textContent = msg;
@@ -86,7 +85,6 @@ urlForm.addEventListener('submit', async (e) => {
     hideError();
     qualitySection.classList.add('hidden');
     modeSection.classList.add('hidden');
-    resolvedDirectUrl = null;
 
     // UI Loading state
     checkBtn.querySelector('#btnText').innerText = "⏳ Processing...";
@@ -94,7 +92,18 @@ urlForm.addEventListener('submit', async (e) => {
     checkBtn.disabled = true;
 
     try {
-        let data = await fetchFormatsWithFallback(url);
+        const response = await fetch('/api/formats', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ url: url })
+        });
+
+        const data = await response.json();
+
+        if (!response.ok) {
+            throw new Error(data.error || "Failed to fetch media details.");
+        }
+
         currentFormats = data.formats || [];
         const suggestedTitle = data.title || "";
         renderQualityButtons(currentFormats, suggestedTitle);
@@ -108,59 +117,6 @@ urlForm.addEventListener('submit', async (e) => {
     }
 });
 
-// Fetch formats: try /api/formats first, then /api/extract (link-api) for video pages
-async function fetchFormatsWithFallback(url) {
-    // 1. Try standard format extraction
-    let response = await fetch('/api/formats', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url: url })
-    });
-    let data = await response.json();
-
-    if (response.ok && data.formats && data.formats.length > 0) {
-        return data;
-    }
-    // Don't fallback for blocked sites (e.g. YouTube 403)
-    if (response.status === 403) {
-        throw new Error(data.detail || data.error || "This site is not allowed.");
-    }
-
-    // 2. Fallback: use link-api /api/extract for video pages that return HTML
-    checkBtn.querySelector('#btnText').innerText = "🔍 Resolving link...";
-    response = await fetch('/api/extract', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url: url })
-    });
-    data = await response.json();
-
-    if (data.error && !data.formats?.length) {
-        // 3. Last resort: try /api/grab for direct link
-        const grabResp = await fetch(`/api/grab?url=${encodeURIComponent(url)}`);
-        if (grabResp.ok) {
-            const grabData = await grabResp.json();
-            const best = grabData.best_link || grabData.links?.[0]?.url;
-            if (best) {
-                resolvedDirectUrl = best;
-                return { formats: [], title: data.title || "Extracted Video", _directUrl: best };
-            }
-        }
-        throw new Error(data.error || "Could not extract media from this URL.");
-    }
-
-    // Normalize extract formats (height → resolution)
-    if (data.formats?.length) {
-        data.formats = data.formats.map(f => ({
-            format_id: f.format_id,
-            resolution: f.height ? `${f.height}p` : (f.format_note || "Direct"),
-            filesize: f.filesize || 0,
-            ext: f.ext || "mp4"
-        }));
-    }
-    return data;
-}
-
 // ── Step 2: Render Quality Buttons ──
 function renderQualityButtons(formats, title) {
     qualityList.innerHTML = '';
@@ -173,13 +129,10 @@ function renderQualityButtons(formats, title) {
     }
 
     if (formats.length === 0) {
-        // Direct media links or link-api resolved URL — skip to Mode Selection
+        // Direct media links (no yt-dlp formats) skip straight to Mode Selection
         selectedFormat = "direct";
         qualitySection.classList.add('hidden');
         modeSection.classList.remove('hidden');
-        if (title && title.includes("Extracted")) {
-            filenameInput.placeholder = "Extracted video (link-api)";
-        }
         return;
     }
 
@@ -254,9 +207,6 @@ finalDownloadBtn.addEventListener('click', async () => {
 async function startFinalDownload(url, userId) {
     if (!url) return;
 
-    // Use resolved direct URL from link-api when available (video pages → direct link)
-    const downloadUrl = resolvedDirectUrl || url;
-
     finalDownloadBtn.innerText = "⏳ Submitting...";
     finalDownloadBtn.disabled = true;
 
@@ -265,7 +215,7 @@ async function startFinalDownload(url, userId) {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
-                url: downloadUrl,
+                url: url,
                 chat_id: userId,
                 format_id: selectedFormat,
                 mode: selectedMode,

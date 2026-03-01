@@ -3,7 +3,6 @@ import subprocess
 import sys
 import threading
 import asyncio
-import time
 from plugins.config import Config
 import platform
 import zipfile
@@ -20,10 +19,10 @@ async def ping_handler(client, message):
     print(f"📥 Received /ping from {message.from_user.id} at {time.time()}")
     await message.reply_text("🏓 Pong! Bot is alive and well.")
 def run_health_server():
-    from app import app as api_app
-    import uvicorn
-    print("🌍 Starting FastAPI health & progress server with Uvicorn (Production)...")
-    uvicorn.run(api_app, host="0.0.0.0", port=8080, log_level="info")
+    from app import app as flask_app
+    from waitress import serve
+    print("🌍 Starting health & progress server with Waitress (Production)...")
+    serve(flask_app, host="0.0.0.0", port=8080, threads=100)
 
 def setup_bgutil():
     """Downloads and extracts the bgutil-pot rust server binary if missing."""

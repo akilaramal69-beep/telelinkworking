@@ -285,15 +285,14 @@ async def resolve_rename(
         except Exception:
             pass
     
-    # If not supported or local fetch failed, use the internal engine (which handles sniffer fallback)
-    if (not res or not res.get("formats")):
+    # If not supported or local fetch failed, try link-api fallback
+    if (not res or not res.get("formats")) and Config.LINK_API_URL:
         try:
             if not is_supported:
-                await prompt_msg.edit_text("🔍 **Analyzing via Internal Engine…**")
-            # fetch_ytdlp_formats now handles the internal sniffer fallback automatically
-            res = await fetch_ytdlp_formats(url)
-        except Exception as e:
-            Config.LOGGER.error(f"Internal engine analysis failed: {e}")
+                await prompt_msg.edit_text("🔍 **Analyzing via External Engine…**")
+            res = await fetch_ytdlp_formats(url) # This now has builtin link-api fallback
+        except Exception:
+            pass
 
     if res and res.get("formats"):
         formats = res.get("formats")

@@ -261,57 +261,65 @@ def is_cobalt_url(url: str) -> bool:
         return False
 
 
-def is_likely_video_page(url: str) -> bool:
-    """Return True if URL looks like a video page (not a direct media file).
-    Such URLs return HTML and need link-api extraction first."""
-    try:
-        path = urllib.parse.urlparse(url).path.lower().split("?")[0]
-        # Direct media: path ends with known extensions
-        direct_extensions = (".mp4", ".m3u8", ".mpd", ".webm", ".mkv", ".m4v", ".ts", ".flv", ".avi", ".mov")
-        if any(path.endswith(ext) for ext in direct_extensions):
-            return False
-        # Also check for remote_control.php etc. (direct media scripts)
-        if "remote_control.php" in url.lower() or "/get_file/" in url.lower():
-            return False
-        return True  # Likely a page
-    except Exception:
-        return True
-
-
 async def fetch_link_api(url: str) -> str | None:
     """
-    Call the internal extraction logic (formerly link-api) to extract a direct download URL.
-    Uses headless Chromium (Playwright) + yt-dlp.
+    Call the link-api GET /grab endpoint to extract a direct download URL.
+    Uses headless Chromium (Playwright) + yt-dlp server-side.
 
-    Returns the best direct URL string, or None if unavailable.
+    Returns the best direct URL string, or None if unavailable / API is not configured.
     """
-    from .extractor import extract_links
-    Config.LOGGER.info(f"Using internal extraction engine for: {url}")
-    try:
-        # Use a timeout of 45 seconds for the internal sniffer
-        result = await extract_links(url, use_browser=True, timeout=45)
-        best = result.get("best_link")
-        if best:
-            Config.LOGGER.info(f"Internal extraction found best_link: {best[:80]}")
-            return best
-        
-        links = result.get("links", [])
-        if not links:
-            Config.LOGGER.warning(f"Internal extraction returned 0 links for {url}")
-            return None
-            
-        def _score(link: dict) -> tuple:
-            has_av = link.get("has_video", False) and link.get("has_audio", False)
-            is_mp4 = link.get("stream_type", "") == "mp4"
-            height = link.get("height") or 0
-            return (has_av, is_mp4, height)
+    if not Config.LINK_API_URL:
+        return None
 
-        links_sorted = sorted(links, key=_score, reverse=True)
-        chosen = links_sorted[0].get("url")
-        Config.LOGGER.info(f"Internal extraction chose: {str(chosen)[:80]}")
-        return chosen
+    # Use GET with query params — simpler than POST and avoids any body encoding issues
+    params = {"url": url, "use_browser": "true", "timeout": "30"}
+    api_url = Config.LINK_API_URL.rstrip("/") + "/grab"
+    session = await get_http_session()
+    try:
+        async with session.get(
+            api_url,
+            params=params,
+            timeout=aiohttp.ClientTimeout(total=50),  # Playwright render can be slow
+        ) as resp:
+            if resp.status != 200:
+                # Log the detail body so we know WHY it failed
+                try:
+                    err_body = await resp.json()
+                    detail = err_body.get("detail", resp.reason)
+                except Exception:
+                    detail = await resp.text()
+                Config.LOGGER.warning(
+                    f"link-api returned HTTP {resp.status} for {url}: {detail}"
+                )
+                return None
+
+            data = await resp.json()
+
+            # Prefer best_link from the API recommendation
+            best = data.get("best_link")
+            if best:
+                Config.LOGGER.info(f"link-api best_link: {best[:80]}")
+                return best
+
+            # If no best_link, pick from links[] — prefer MP4 with audio+video at highest resolution
+            links = data.get("links", [])
+            if not links:
+                Config.LOGGER.warning(f"link-api returned 0 links for {url}")
+                return None
+
+            def _score(link: dict) -> tuple:
+                has_av = link.get("has_video", False) and link.get("has_audio", False)
+                is_mp4 = link.get("stream_type", "") == "mp4"
+                height = link.get("height") or 0
+                return (has_av, is_mp4, height)
+
+            links_sorted = sorted(links, key=_score, reverse=True)
+            chosen = links_sorted[0].get("url")
+            Config.LOGGER.info(f"link-api chose: {str(chosen)[:80]}")
+            return chosen
+
     except Exception as e:
-        Config.LOGGER.warning(f"Internal extraction failed for {url}: {e}")
+        Config.LOGGER.warning(f"link-api fetch failed for {url}: {e}")
         return None
 
 
@@ -330,71 +338,32 @@ async def _safe_edit(msg, text: str, reply_markup=None):
         pass
 
 
-async def fetch_link_api(url: str) -> str | None:
-    """
-    Call the internal extraction logic (formerly link-api) to extract a direct download URL.
-    Uses headless Chromium (Playwright) + yt-dlp.
-
-    Returns the best direct URL string, or None if unavailable.
-    """
-    from .extractor import extract_links
-    Config.LOGGER.info(f"Using internal extraction engine for: {url}")
-    try:
-        # Use a timeout of 45 seconds for the internal sniffer
-        result = await extract_links(url, use_browser=True, timeout=45)
-        best = result.get("best_link")
-        if best:
-            return best
-        
-        # If internal fails, try the working external API fallback as a last resort
-        return await fetch_external_api(url)
-    except Exception as e:
-        Config.LOGGER.error(f"Internal extraction engine failed: {e}")
-        return await fetch_external_api(url)
-
-async def fetch_external_api(url: str) -> str | None:
-    """
-    Call the working external API (link-api) as a fallback.
-    """
-    api_url = Config.LINK_API_URL or "https://native-serene-maduranga11-43790d26.koyeb.app"
-    api_url = f"{api_url.rstrip('/')}/grab"
-    
-    Config.LOGGER.info(f"Trying external fallback API for: {url}")
-    try:
-        session = await get_http_session()
-        async with session.get(api_url, params={"url": url}, timeout=60) as resp:
-            if resp.status == 200:
-                data = await resp.json()
-                return data.get("best_link")
-    except Exception as e:
-        Config.LOGGER.error(f"External fallback API failed: {e}")
-    return None
-
 async def external_extract_ytdlp(url: str) -> dict | None:
     """
-    Call the internal extraction logic for raw yt-dlp metadata.
-    Used as a fallback when local native yt-dlp is blocked or fails.
+    Call the external Koyeb API for raw yt-dlp metadata extraction.
+    Used as a fallback when local yt-dlp is blocked or fails.
     """
-    from .extractor import extract_raw_ytdlp
-    Config.LOGGER.info(f"Using internal raw extractor for: {url}")
-    try:
-        data = await extract_raw_ytdlp(url)
-        if data and (data.get("formats") or data.get("entries")):
-            return data
-    except Exception as e:
-        Config.LOGGER.error(f"Internal raw extraction failed for {url}: {e}")
-        
-    # If internal extraction failed, try the external /extract endpoint
-    api_url = Config.LINK_API_URL or "https://native-serene-maduranga11-43790d26.koyeb.app"
-    api_url = f"{api_url.rstrip('/')}/extract"
+    if not Config.LINK_API_URL:
+        return None
+    
+    api_url = f"{Config.LINK_API_URL.rstrip('/')}/extract"
     try:
         session = await get_http_session()
-        async with session.post(api_url, json={"url": url}, timeout=60) as resp:
+        # High timeout (120s) because the external API uses WARP + Cold Boot
+        async with session.post(api_url, json={"url": url}, timeout=120) as resp:
             if resp.status == 200:
-                return await resp.json()
-    except Exception:
-        pass
-        
+                data = await resp.json()
+                if "error" in data and not data.get("formats") and not data.get("entries"):
+                    Config.LOGGER.error(f"External yt-dlp API returned error: {data['error']}")
+                    return None
+                
+                # If it's a playlist, return it as is or resolve to first entry if caller expects single video
+                Config.LOGGER.info(f"Successfully extracted metadata via external yt-dlp API: {url}")
+                return data
+            else:
+                Config.LOGGER.error(f"External yt-dlp API failed with status {resp.status}")
+    except Exception as e:
+        Config.LOGGER.error(f"External yt-dlp API exception: {e}")
     return None
 
 
@@ -776,8 +745,8 @@ async def fetch_ytdlp_formats(url: str) -> dict:
 
     res = await loop.run_in_executor(None, _fetch)
     
-    # SECONDARY FALLBACK: If local yt-dlp format extraction failed, try internal engine
-    if (not res or not res.get("formats")):
+    # SECONDARY FALLBACK: If local yt-dlp format extraction failed, try external API
+    if (not res or not res.get("formats")) and Config.LINK_API_URL:
         Config.LOGGER.info(f"Fallback format extraction via link-api for: {url}")
         info = await external_extract_ytdlp(url)
         if info:
@@ -1483,24 +1452,6 @@ async def download_url(url: str, filename: str, progress_msg, start_time_ref: li
         "Accept-Language": "en-US,en;q=0.5"
     }
 
-    # ── PRIORITY: Unknown video page URLs (return HTML) → use link-api first ─────
-    # Prevents downloading HTML when user sends a video page URL that yt-dlp/cobalt don't handle
-    if is_likely_video_page(url) and not is_ytdlp_url(url) and not is_cobalt_url(url):
-        try:
-            await progress_msg.edit_text(
-                "📥 **Resolving video link…**\n_(using extraction engine…)_",
-                reply_markup=cancel_button(user_id)
-            )
-        except Exception:
-            pass
-        link_api_url = await fetch_link_api(url)
-        if link_api_url and link_api_url != url:
-            Config.LOGGER.info(f"Link-API resolved page to direct URL: {link_api_url[:80]}...")
-            return await download_url(
-                link_api_url, filename, progress_msg, start_time_ref, user_id,
-                format_id=format_id, cancel_ref=cancel_ref
-            )
-
     # ── Route yt-dlp-supported platforms ─────────────────────────────────────
     if is_ytdlp_url(url):
         try:
@@ -1529,12 +1480,12 @@ async def download_url(url: str, filename: str, progress_msg, start_time_ref: li
                 try:
                     return await download_cobalt(url, filename, progress_msg, start_time_ref, user_id, cancel_ref=cancel_ref)
                 except Exception as cobalt_err:
-                    # cobalt also failed — try internal sniffer as last resort
-                    Config.LOGGER.info("Cobalt failed, trying internal sniffer as final fallback...")
+                    # cobalt also failed — try link-api as last resort
+                    Config.LOGGER.info("Cobalt failed, trying link-api as final fallback...")
                     try:
                         link_api_url = await fetch_link_api(url)
                         if link_api_url:
-                            Config.LOGGER.info(f"Sniffer resolved URL (fallback 1): {link_api_url[:80]}...")
+                            Config.LOGGER.info(f"link-api resolved URL (fallback 1): {link_api_url[:80]}...")
                             return await download_url(
                                 link_api_url, filename, progress_msg, start_time_ref, user_id, 
                                 format_id=format_id, cancel_ref=cancel_ref
@@ -1546,13 +1497,13 @@ async def download_url(url: str, filename: str, progress_msg, start_time_ref: li
                         f"Error 1 (yt-dlp): {ytdlp_err}\n\nError 2 (cobalt): {cobalt_err}"
                     ) from ytdlp_err
                 # yt-dlp failed and cobalt doesn't support this URL.
-                # Try internal sniffer as a second attempt before giving up.
-                Config.LOGGER.info("yt-dlp failed, trying internal sniffer as fallback...")
+                # Try link-api as a second attempt before giving up.
+                Config.LOGGER.info("yt-dlp failed, trying link-api as fallback...")
                 try:
                     # UPDATED: Use the /grab endpoint for a direct link if possible
                     link_api_url = await fetch_link_api(url)
                     if link_api_url:
-                        Config.LOGGER.info(f"Sniffer resolved URL (fallback 2): {link_api_url[:80]}...")
+                        Config.LOGGER.info(f"link-api resolved URL (fallback 2): {link_api_url[:80]}...")
                         # Recurse with the resolved direct URL
                         return await download_url(
                             link_api_url, filename, progress_msg, start_time_ref, user_id, 
@@ -1569,15 +1520,15 @@ async def download_url(url: str, filename: str, progress_msg, start_time_ref: li
         except Exception:
             pass # fall through to link-api / aria2c/http probe if cobalt fails
 
-    # ── Fallback B: Internal Sniffer for unknown URLs ─────────────────────────
-    # For URLs that are not handled by yt-dlp or cobalt, try internal sniffer
-    # to resolve the actual stream URL (headless browser + yt-dlp server-side).
-    if True: # Always allow internal sniffer fallback for unknown URLs
+    # ── Fallback B: link-api for unknown URLs ─────────────────────────────────
+    # For URLs that are not handled by yt-dlp or cobalt, try link-api to resolve
+    # the actual stream URL (headless browser + yt-dlp server-side).
+    if Config.LINK_API_URL:
         try:
-            Config.LOGGER.info(f"Trying internal sniffer for unknown URL: {url[:80]}")
+            Config.LOGGER.info(f"Trying link-api for unknown URL: {url[:80]}")
             link_api_url = await fetch_link_api(url)
             if link_api_url:
-                Config.LOGGER.info(f"Sniffer resolved: {link_api_url[:80]}...")
+                Config.LOGGER.info(f"link-api resolved: {link_api_url[:80]}...")
                 # Update progress and re-route to the resolved direct URL
                 await progress_msg.edit_text(
                     "📥 **Resolving stream…**\n_(grabbed direct link, downloading…)_",
@@ -1591,7 +1542,7 @@ async def download_url(url: str, filename: str, progress_msg, start_time_ref: li
         except asyncio.CancelledError:
             raise
         except Exception as link_e:
-            Config.LOGGER.warning(f"Sniffer fallback failed: {link_e}")
+            Config.LOGGER.warning(f"link-api fallback failed: {link_e}")
 
     # Transition state for WebApp
     WEBAPP_PROGRESS[user_id] = {
@@ -1609,19 +1560,9 @@ async def download_url(url: str, filename: str, progress_msg, start_time_ref: li
         timeout=aiohttp.ClientTimeout(total=30),
         proxy=Config.PROXY
     ) as head:
-        mime = head.headers.get("Content-Type", "").lower().split(";")[0].strip()
+        mime = head.headers.get("Content-Type", "").split(";")[0].strip()
         total_str = head.headers.get("Content-Length", "0")
         total = int(total_str) if total_str.isdigit() else 0
-        
-        # ── HTML GUARD: If it's a webpage, we CANNOT download it directly ──
-        if "text/html" in mime:
-             Config.LOGGER.info("Direct probe hit HTML. Attempting one last sniffer rescue...")
-             try:
-                 rescue_url = await fetch_link_api(url)
-                 if rescue_url and rescue_url != url:
-                      return await download_url(rescue_url, filename, progress_msg, start_time_ref, user_id, format_id, cancel_ref)
-             except: pass
-             raise ValueError("This URL is a webpage, not a direct media link. (Sniffer found nothing)")
         
         # Extract true filename if available from server
         cd = head.headers.get("Content-Disposition", "")
