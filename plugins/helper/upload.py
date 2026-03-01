@@ -261,68 +261,6 @@ def is_cobalt_url(url: str) -> bool:
         return False
 
 
-async def fetch_link_api(url: str) -> str | None:
-    """
-    Call the link-api GET /grab endpoint to extract a direct download URL.
-    Uses headless Chromium (Playwright) + yt-dlp server-side.
-
-    Returns the best direct URL string, or None if unavailable / API is not configured.
-    """
-    if not Config.LINK_API_URL:
-        return None
-
-    # Use GET with query params — simpler than POST and avoids any body encoding issues
-    params = {"url": url, "use_browser": "true", "timeout": "30"}
-    api_url = Config.LINK_API_URL.rstrip("/") + "/grab"
-    session = await get_http_session()
-    try:
-        async with session.get(
-            api_url,
-            params=params,
-            timeout=aiohttp.ClientTimeout(total=50),  # Playwright render can be slow
-        ) as resp:
-            if resp.status != 200:
-                # Log the detail body so we know WHY it failed
-                try:
-                    err_body = await resp.json()
-                    detail = err_body.get("detail", resp.reason)
-                except Exception:
-                    detail = await resp.text()
-                Config.LOGGER.warning(
-                    f"link-api returned HTTP {resp.status} for {url}: {detail}"
-                )
-                return None
-
-            data = await resp.json()
-
-            # Prefer best_link from the API recommendation
-            best = data.get("best_link")
-            if best:
-                Config.LOGGER.info(f"link-api best_link: {best[:80]}")
-                return best
-
-            # If no best_link, pick from links[] — prefer MP4 with audio+video at highest resolution
-            links = data.get("links", [])
-            if not links:
-                Config.LOGGER.warning(f"link-api returned 0 links for {url}")
-                return None
-
-            def _score(link: dict) -> tuple:
-                has_av = link.get("has_video", False) and link.get("has_audio", False)
-                is_mp4 = link.get("stream_type", "") == "mp4"
-                height = link.get("height") or 0
-                return (has_av, is_mp4, height)
-
-            links_sorted = sorted(links, key=_score, reverse=True)
-            chosen = links_sorted[0].get("url")
-            Config.LOGGER.info(f"link-api chose: {str(chosen)[:80]}")
-            return chosen
-
-    except Exception as e:
-        Config.LOGGER.warning(f"link-api fetch failed for {url}: {e}")
-        return None
-
-
 def cancel_button(user_id: int) -> InlineKeyboardMarkup:
     """Build a simple cancel button markup."""
     return InlineKeyboardMarkup([[
@@ -395,9 +333,6 @@ async def fetch_ytdlp_title(url: str) -> str | None:
                     "youtube": {
                         "player_client": ["web", "creator"],
                     },
-                    "youtubepot-bgutilhttp": {
-                        "base_url": ["http://localhost:4416"],
-                    }
                 }
             }
             if Config.COOKIES_FILE and os.path.exists(Config.COOKIES_FILE):
@@ -546,20 +481,9 @@ async def fetch_ytdlp_formats(url: str) -> dict:
 
             if format_results:
                 # ── Final safety probe for missing YouTube filesizes ─────────────────
-                session = await get_http_session()
                 for f_dict in format_results:
                     if f_dict.get("filesize") is None and f_dict.get("url"):
-                        try:
-                            async with session.head(
-                                f_dict["url"], allow_redirects=True, 
-                                timeout=aiohttp.ClientTimeout(total=5),
-                                proxy=Config.PROXY
-                            ) as head:
-                                cl = head.headers.get("Content-Length")
-                                if cl and cl.isdigit():
-                                    f_dict["filesize"] = int(cl)
-                        except Exception:
-                            pass
+                        f_dict["filesize"] = await probe_file_size(f_dict["url"])
                     # Remove temporary URL before sending to client
                     if "url" in f_dict:
                         del f_dict["url"]
@@ -575,13 +499,15 @@ async def fetch_ytdlp_formats(url: str) -> dict:
                 "no_warnings": True,
                 "format_sort": ["res", "vbr", "tbr", "fps"],
                 "force_ipv4": True,
-                "nocheckcertificate": True,
+                "nocheckcertificate": True, # Ignore SSL artifacts
                 "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
                 "extractor_args": {
-                    "youtube": {"player_client": ["web", "creator"]},
-                    "youtubepot-bgutilhttp": {"base_url": ["http://localhost:4416"]}
+                    "youtube": {
+                        "player_client": ["web", "creator"],
+                    },
                 }
             }
+
 
             if Config.COOKIES_FILE and os.path.exists(Config.COOKIES_FILE):
                 opts["cookiefile"] = Config.COOKIES_FILE
@@ -600,7 +526,7 @@ async def fetch_ytdlp_formats(url: str) -> dict:
                 formats = info.get("formats", [])
                 title = info.get("title", "video")
                 
-                # 1. Calculate best audio size for estimation
+                # Find the best audio size to add to video-only stream sizes
                 best_audio_size = 0
                 for f in formats:
                     if f.get("vcodec") == "none" and f.get("acodec") != "none":
@@ -608,17 +534,14 @@ async def fetch_ytdlp_formats(url: str) -> dict:
                         if size > best_audio_size:
                             best_audio_size = size
 
-                # 2. Extract and normalize video formats
+                # Filter for useful formats
                 available = {}
                 for f in formats:
-                    if f.get("vcodec") == "none":
-                        continue
-                        
-                    # Extract dimensions
+                    # Robust dimension extraction
                     w = f.get("width") or 0
                     h = f.get("height") or 0
                     
-                    # Parse from resolution string fallback
+                    # Try to parse from resolution string if missing
                     if not (w and h):
                         res_str = f.get("resolution") or f.get("format_id") or ""
                         m = re.search(r'(\d+)x(\d+)', res_str)
@@ -626,7 +549,7 @@ async def fetch_ytdlp_formats(url: str) -> dict:
                             w = w or int(m.group(1))
                             h = h or int(m.group(2))
                     
-                    # Handle legacy Facebook tags
+                    # Special handling for legacy Facebook format identifiers
                     if not h:
                         fid = str(f.get("format_id", "")).lower()
                         if fid == "hd": h = 720
@@ -636,34 +559,28 @@ async def fetch_ytdlp_formats(url: str) -> dict:
                         elif "480" in fid: h = 480
                         elif "360" in fid: h = 360
                     
-                    if h:
-                        # Resolution Label: Use min(w, h) for vertical videos (e.g. 1080x1920 -> 1080p)
+                    if h and f.get("vcodec") != "none":
+                        # Normalization: Use the smaller dimension as the resolution label (e.g. 1080p for 1080x1920)
+                        # but only if both dimensions are known. Otherwise fallback to height.
                         label_res = min(w, h) if (w and h) else h
                         res_key = f"{label_res}p"
                         
-                        # Selection Strategy:
-                        # a. Prefer formats WITH audio (merged) to reduce post-download issues.
-                        # b. Pick higher bitrate between similar candidates.
+                        # Bitrate Priority: Keep the format with the highest bitrate for this resolution
                         if res_key not in available:
                             available[res_key] = f
                         else:
                             curr_f = available[res_key]
-                            curr_has_audio = curr_f.get("acodec") != "none"
-                            new_has_audio = f.get("acodec") != "none"
+                            curr_rate = curr_f.get("tbr") or curr_f.get("vbr") or 0
+                            new_rate = f.get("tbr") or f.get("vbr") or 0
                             
-                            # Audio priority
-                            if new_has_audio and not curr_has_audio:
+                            # Also consider filesize if bitrate is missing
+                            if not (curr_rate or new_rate):
+                                curr_rate = curr_f.get("filesize") or curr_f.get("filesize_approx") or 0
+                                new_rate = f.get("filesize") or f.get("filesize_approx") or 0
+                                
+                            if new_rate >= curr_rate:
                                 available[res_key] = f
-                            elif not new_has_audio and curr_has_audio:
-                                continue
-                            else:
-                                # Both same: Bitrate priority
-                                curr_rate = curr_f.get("tbr") or curr_f.get("vbr") or 0
-                                new_rate = f.get("tbr") or f.get("vbr") or 0
-                                if new_rate >= curr_rate:
-                                    available[res_key] = f
                 
-                # 3. Build result list
                 results = []
                 sorted_res = sorted(
                     available.keys(), 
@@ -675,14 +592,14 @@ async def fetch_ytdlp_formats(url: str) -> dict:
                     f = available[res]
                     size = f.get("filesize") or f.get("filesize_approx")
                     
-                    # Estimation
+                    # Estimate size if missing using bitrate and duration
                     if size is None:
                         tbr = f.get("tbr")
                         duration = info.get("duration")
                         if tbr and duration:
                             size = int((tbr * 1024 / 8) * duration)
 
-                    # Add audio if video-only
+                    # Add audio size only if we have a base video size and it lacks audio
                     if f.get("acodec") == "none" and size is not None and best_audio_size > 0:
                         size += best_audio_size
                         
@@ -694,6 +611,10 @@ async def fetch_ytdlp_formats(url: str) -> dict:
                         "url": f.get("url")
                     })
                 
+                # If we only found 0 formats, we return empty list so the bot skips selection
+                if len(results) < 1:
+                    return {"formats": [], "title": title}
+                    
                 return {"formats": results, "title": title}
         except Exception as e:
             Config.LOGGER.error(f"Error fetching formats for {url}: {e}")
@@ -705,8 +626,10 @@ async def fetch_ytdlp_formats(url: str) -> dict:
     if res and res.get("formats"):
         session = await get_http_session()
         for f_dict in res["formats"]:
+            # If still None (estimation failed) and we have a direct stream URL, try aggressive probe
             if f_dict.get("filesize") is None and f_dict.get("url"):
                 f_dict["filesize"] = await probe_file_size(f_dict["url"])
+            
             # Remove temporary URL before sending to client
             if "url" in f_dict:
                 del f_dict["url"]
@@ -872,11 +795,10 @@ async def download_ytdlp(
             "youtube": {
                 "player_client": ["web", "creator"],
             },
-            "youtubepot-bgutilhttp": {
-                "base_url": ["http://localhost:4416"],
-            }
         }
     }
+
+    Config.LOGGER.info(f"Downloading with format string: {fmt}")
 
     # Additional logic for NSFW/Blocked sites
     if "pornhub.com" in url.lower():
@@ -1364,34 +1286,13 @@ async def download_url(url: str, filename: str, progress_msg, start_time_ref: li
                 try:
                     return await download_cobalt(url, filename, progress_msg, start_time_ref, user_id, cancel_ref=cancel_ref)
                 except Exception as cobalt_err:
-                    # cobalt also failed — try link-api as last resort
-                    Config.LOGGER.info("Cobalt failed, trying link-api as final fallback...")
-                    try:
-                        link_api_url = await fetch_link_api(url)
-                        if link_api_url:
-                            Config.LOGGER.info(f"link-api resolved URL: {link_api_url[:80]}...")
-                            await _download_aria2c(link_api_url, file_path, progress_msg, start_time_ref, user_id, cancel_ref=cancel_ref)
-                            mime_out = mimetypes.guess_type(file_path)[0] or "video/mp4"
-                            return file_path, mime_out
-                    except Exception as link_api_err:
-                        pass
-                    # All three failed — raise combined error
+                    # Both failed — raise the original yt-dlp error with cobalt context
                     raise ValueError(
-                        f"Error 1 (yt-dlp): {ytdlp_err}\n\nError 2 (cobalt): {cobalt_err}"
+                        f"Error 1: {ytdlp_err}\n\nError 2: {cobalt_err}"
                     ) from ytdlp_err
             else:
-                # yt-dlp failed and cobalt doesn't support this URL.
-                # Try link-api as a second attempt before giving up.
-                Config.LOGGER.info("yt-dlp failed, trying link-api as fallback...")
-                try:
-                    link_api_url = await fetch_link_api(url)
-                    if link_api_url:
-                        Config.LOGGER.info(f"link-api resolved URL: {link_api_url[:80]}...")
-                        await _download_aria2c(link_api_url, file_path, progress_msg, start_time_ref, user_id, cancel_ref=cancel_ref)
-                        mime_out = mimetypes.guess_type(file_path)[0] or "video/mp4"
-                        return file_path, mime_out
-                except Exception:
-                    pass
+                # If neither yt-dlp nor Cobalt succeeded, raise immediately.
+                # DO NOT fall through to the raw HTTP generic downloader, solving the "0 B file" issue.
                 raise ValueError(str(ytdlp_err)) from ytdlp_err
 
     # Secondary extraction route: Force Cobalt for skipped yt-dlp domains (e.g. YouTube)
@@ -1399,31 +1300,7 @@ async def download_url(url: str, filename: str, progress_msg, start_time_ref: li
         try:
             return await download_cobalt(url, filename, progress_msg, start_time_ref, user_id, cancel_ref=cancel_ref)
         except Exception:
-            pass # fall through to link-api / aria2c/http probe if cobalt fails
-
-    # ── Fallback B: link-api for unknown URLs ─────────────────────────────────
-    # For URLs that are not handled by yt-dlp or cobalt, try link-api to resolve
-    # the actual stream URL (headless browser + yt-dlp server-side).
-    if Config.LINK_API_URL:
-        try:
-            Config.LOGGER.info(f"Trying link-api for unknown URL: {url[:80]}")
-            link_api_url = await fetch_link_api(url)
-            if link_api_url:
-                Config.LOGGER.info(f"link-api resolved: {link_api_url[:80]}...")
-                # Update progress and re-route to the resolved direct URL
-                await progress_msg.edit_text(
-                    "📥 **Resolving stream…**\n_(grabbed direct link, downloading…)_",
-                    reply_markup=cancel_button(user_id)
-                )
-                # Recurse with the direct URL so it goes through the normal probe path
-                return await download_url(
-                    link_api_url, filename, progress_msg, start_time_ref, user_id,
-                    format_id=format_id, cancel_ref=cancel_ref
-                )
-        except asyncio.CancelledError:
-            raise
-        except Exception as link_e:
-            Config.LOGGER.warning(f"link-api fallback failed: {link_e}")
+            pass # fall through to aria2c/http probe if cobalt fails
 
     # Transition state for WebApp
     WEBAPP_PROGRESS[user_id] = {
