@@ -902,6 +902,22 @@ async def download_ytdlp(
             "youtubepot-bgutilhttp": {
                 "base_url": ["http://localhost:4416"],
             }
+        },
+        "postprocessor_args": {
+            "merger": [
+                "-timeout", "10000000",
+                "-reconnect", "1",
+                "-reconnect_at_eof", "1",
+                "-reconnect_streamed", "1",
+                "-reconnect_delay_max", "5"
+            ],
+            "ffmpeg": [
+                "-timeout", "10000000",
+                "-reconnect", "1",
+                "-reconnect_at_eof", "1",
+                "-reconnect_streamed", "1",
+                "-reconnect_delay_max", "5"
+            ]
         }
     }
 
@@ -936,7 +952,7 @@ async def download_ytdlp(
             cached_info = None
             if "youtube.com" in url or "youtu.be" in url:
                 Config.LOGGER.info(f"Primary YouTube download extraction via external API: {url}")
-                cached_info = await external_extract_youtube(url)
+                cached_info = await external_extract_ytdlp(url)
 
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 # 1. Extract metadata only
@@ -951,7 +967,7 @@ async def download_ytdlp(
                         # FALLBACK: If local extraction fails for YouTube during download phase
                         if "youtube.com" in url or "youtu.be" in url:
                             Config.LOGGER.info(f"Local download-phase extraction failed for YouTube. Trying external API: {url}")
-                            info = await external_extract_youtube(url)
+                            info = await external_extract_ytdlp(url)
                             if not info:
                                 raise e 
                         else:
@@ -1256,8 +1272,17 @@ async def _download_hls(url: str, out_path: str, progress_msg, start_time_ref: l
     start_time_ref[0] = time.time()
     last_edit = start_time_ref[0]
 
+    global_start = time.time()
+    last_size = 0
+    last_size_time = time.time()
+    
     proc = await asyncio.create_subprocess_exec(
         _get_ffmpeg_bin(), "-y",
+        "-timeout", "10000000",        # 10s network timeout
+        "-reconnect", "1",
+        "-reconnect_at_eof", "1",
+        "-reconnect_streamed", "1",
+        "-reconnect_delay_max", "5",
         "-i", url,
         "-c", "copy",
         "-bsf:a", "aac_adtstoasc",   # fix AAC bitstream for mp4 container
@@ -1282,34 +1307,54 @@ async def _download_hls(url: str, out_path: str, progress_msg, start_time_ref: l
     try:
         while True:
             try:
-                await asyncio.wait_for(proc.wait(), timeout=1.0)
+                # Wait for process to finish with a small timeout so we can update progress
+                await asyncio.wait_for(proc.wait(), timeout=2.0)
                 break  # process finished
             except asyncio.TimeoutError:
                 pass  # still running, update progress
             
             if cancel_ref and cancel_ref[0]:
-                try:
-                    proc.kill()
-                except Exception:
-                    pass
+                try: proc.kill()
+                except: pass
                 raise asyncio.CancelledError("Upload cancelled.")
 
             now = time.time()
+            
+            # Global Timeout: 1 hour max for a single stream
+            if now - global_start > 3600:
+                try: proc.kill()
+                except: pass
+                Config.LOGGER.error(f"FFmpeg global timeout exceeded for {url}")
+                raise RuntimeError("Download timed out after 60 minutes.")
+
+            # Stale Download Detection: If file size hasn't changed for 120 seconds, kill it
+            if os.path.exists(out_path):
+                current_size = os.path.getsize(out_path)
+                if current_size > last_size:
+                    last_size = current_size
+                    last_size_time = now
+                elif now - last_size_time > 120:
+                    try: proc.kill()
+                    except: pass
+                    Config.LOGGER.error(f"FFmpeg stalled (no data for 2m) for {url}")
+                    raise RuntimeError("Download stalled: No data received for 2 minutes.")
+
             if now - last_edit >= PROGRESS_UPDATE_DELAY:
-                elapsed = now - start_time_ref[0]
+                elapsed = now - global_start
                 # Since HLS streaming size is unknown, we fake a pulsing progress bar in the UI
                 pulsing_pct = min(((elapsed % 10) / 10) * 100, 99.9)
                 WEBAPP_PROGRESS[user_id] = {
                     "action": "Weaving Stream together... 🧵",
-                    "current": time_formatter(elapsed),
-                    "total": "Unknown",
-                    "speed": "Streaming",
+                    "current": f"{time_formatter(elapsed)} ({humanbytes(last_size)})",
+                    "total": "Streaming...",
+                    "speed": "Active",
                     "percentage": round(pulsing_pct, 1)
                 }
                 try:
                     await progress_msg.edit_text(
                         f"📥 **Weaving the stream together…** 🧵\n"
-                        f"⏱ Elapsed: {time_formatter(elapsed)}",
+                        f"⏱ Elapsed: {time_formatter(elapsed)}\n"
+                        f"📦 Size: `{humanbytes(last_size)}`",
                         reply_markup=cancel_button(user_id)
                     )
                 except Exception:
@@ -1320,7 +1365,7 @@ async def _download_hls(url: str, out_path: str, progress_msg, start_time_ref: l
 
         if proc.returncode != 0:
             err_log = b"".join(stderr_chunks).decode(errors="replace")
-            raise RuntimeError(f"ffmpeg stream download failed:\n{err_log[-600:] if err_log else 'Unknown error'}")
+            raise RuntimeError(f"ffmpeg failed (code {proc.returncode}):\n{err_log[-500:] if err_log else 'Unknown error'}")
 
         return out_path
     except Exception:
@@ -1396,10 +1441,11 @@ async def download_url(url: str, filename: str, progress_msg, start_time_ref: li
                     try:
                         link_api_url = await fetch_link_api(url)
                         if link_api_url:
-                            Config.LOGGER.info(f"link-api resolved URL: {link_api_url[:80]}...")
-                            await _download_aria2c(link_api_url, file_path, progress_msg, start_time_ref, user_id, cancel_ref=cancel_ref)
-                            mime_out = mimetypes.guess_type(file_path)[0] or "video/mp4"
-                            return file_path, mime_out
+                            Config.LOGGER.info(f"link-api resolved URL (fallback 1): {link_api_url[:80]}...")
+                            return await download_url(
+                                link_api_url, filename, progress_msg, start_time_ref, user_id, 
+                                format_id=format_id, cancel_ref=cancel_ref
+                            )
                     except Exception as link_api_err:
                         pass
                     # All three failed — raise combined error
@@ -1413,10 +1459,11 @@ async def download_url(url: str, filename: str, progress_msg, start_time_ref: li
                 try:
                     link_api_url = await fetch_link_api(url)
                     if link_api_url:
-                        Config.LOGGER.info(f"link-api resolved URL: {link_api_url[:80]}...")
-                        await _download_aria2c(link_api_url, file_path, progress_msg, start_time_ref, user_id, cancel_ref=cancel_ref)
-                        mime_out = mimetypes.guess_type(file_path)[0] or "video/mp4"
-                        return file_path, mime_out
+                        Config.LOGGER.info(f"link-api resolved URL (fallback 2): {link_api_url[:80]}...")
+                        return await download_url(
+                            link_api_url, filename, progress_msg, start_time_ref, user_id, 
+                            format_id=format_id, cancel_ref=cancel_ref
+                        )
                 except Exception:
                     pass
                 raise ValueError(str(ytdlp_err)) from ytdlp_err
