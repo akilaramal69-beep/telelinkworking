@@ -274,25 +274,37 @@ async def resolve_rename(
     filename: str,
 ):
     """Proceed to quality selection (if yt-dlp) or mode selection."""
-    if is_ytdlp_url(url):
+    # Try local yt-dlp first
+    is_supported = is_ytdlp_url(url)
+    res = None
+    
+    if is_supported:
         try:
             await prompt_msg.edit_text("🔍 **Analyzing available qualities…**")
+            res = await fetch_ytdlp_formats(url)
         except Exception:
             pass
-        
-        # Only shows quality selector if there are AT LEAST 2 distinct resolutions to choose from
-        res = await fetch_ytdlp_formats(url)
+    
+    # If not supported or local fetch failed, try link-api fallback
+    if (not res or not res.get("formats")) and Config.LINK_API_URL:
+        try:
+            if not is_supported:
+                await prompt_msg.edit_text("🔍 **Analyzing via External Engine…**")
+            res = await fetch_ytdlp_formats(url) # This now has builtin link-api fallback
+        except Exception:
+            pass
+
+    if res and res.get("formats"):
         formats = res.get("formats")
-        if formats:
-            PENDING_FORMATS[user_id] = {"url": url, "filename": filename}
-            try:
-                await prompt_msg.edit_text(
-                    f"🎬 **Select Resolution:**\n`{filename}`",
-                    reply_markup=quality_keyboard(user_id, formats)
-                )
-                return
-            except Exception:
-                pass
+        PENDING_FORMATS[user_id] = {"url": url, "filename": filename}
+        try:
+            await prompt_msg.edit_text(
+                f"🎬 **Select Resolution:**\n`{filename}`",
+                reply_markup=quality_keyboard(user_id, formats)
+            )
+            return
+        except Exception:
+            pass
 
     # Fallback/Direct loop: move straight to mode selection
     PENDING_MODE[user_id] = {"url": url, "filename": filename, "format_id": None}
@@ -523,10 +535,6 @@ async def upload_handler(client: Client, message: Message):
             quote=True,
         )
 
-    # Explicit YouTube Block
-    if "youtube.com" in url.lower() or "youtu.be" in url.lower():
-        return await message.reply_text("❌ YouTube downloading not allowed.", quote=True)
-
     status_info = await message.reply_text("🔍 Analyzing file info…", quote=True)
     try:
         url = await resolve_url(url)
@@ -630,10 +638,6 @@ async def text_handler(client: Client, message: Message):
 
         # Pre-flight check: Extract the real extension via HTTP Sniffing or yt-dlp first!
         
-        # Explicit YouTube Block
-        if "youtube.com" in text.lower() or "youtu.be" in text.lower():
-            return await message.reply_text("❌ YouTube downloading not allowed.", quote=True)
-            
         status_info = await message.reply_text("🔍 Analyzing file info…", quote=True)
         try:
             text = await resolve_url(text)

@@ -390,6 +390,23 @@ async def fetch_ytdlp_title(url: str) -> str | None:
             ext = info.get("ext") or "mp4"
             return f"{title[:80]}.{ext}"
 
+    # SECONDARY FALLBACK: Try external API (link-api) if local yt-dlp fails
+    if Config.LINK_API_URL:
+        Config.LOGGER.info(f"Fallback title extraction via link-api for: {url}")
+        try:
+            info = await external_extract_ytdlp(url)
+            if info:
+                # Handle Playlists: If info has 'entries', take the first one
+                if "entries" in info and info["entries"]:
+                    info = info["entries"][0]
+                
+                title = info.get("title") or info.get("id") or "video"
+                title = re.sub(r'[\\/*?"<>|:\n\r\t]', "_", title).strip()
+                ext = info.get("ext") or "mp4"
+                return f"{title[:80]}.{ext}"
+        except Exception:
+            pass
+
     loop = asyncio.get_running_loop()
 
     def _fetch():
@@ -728,6 +745,33 @@ async def fetch_ytdlp_formats(url: str) -> dict:
 
     res = await loop.run_in_executor(None, _fetch)
     
+    # SECONDARY FALLBACK: If local yt-dlp format extraction failed, try external API
+    if (not res or not res.get("formats")) and Config.LINK_API_URL:
+        Config.LOGGER.info(f"Fallback format extraction via link-api for: {url}")
+        info = await external_extract_ytdlp(url)
+        if info:
+            # Handle Playlists: If info has 'entries', take the first one
+            if "entries" in info and info["entries"]:
+                info = info["entries"][0]
+
+            formats = info.get("formats", [])
+            title = info.get("title", "video")
+            
+            format_results = []
+            for f in formats:
+                height = f.get("height")
+                if height and f.get("vcodec") != "none":
+                    size = f.get("filesize") or f.get("filesize_approx")
+                    format_results.append({
+                        "format_id": f["format_id"],
+                        "resolution": f"{height}p",
+                        "ext": f.get("ext", "mp4"),
+                        "filesize": size,
+                        "url": f.get("url")
+                    })
+            if format_results:
+                res = {"formats": format_results, "title": title}
+
     # ── Final safety probe for missing filesizes ─────────────────────────────
     if res and res.get("formats"):
         session = await get_http_session()
@@ -1452,14 +1496,15 @@ async def download_url(url: str, filename: str, progress_msg, start_time_ref: li
                     raise ValueError(
                         f"Error 1 (yt-dlp): {ytdlp_err}\n\nError 2 (cobalt): {cobalt_err}"
                     ) from ytdlp_err
-            else:
                 # yt-dlp failed and cobalt doesn't support this URL.
                 # Try link-api as a second attempt before giving up.
                 Config.LOGGER.info("yt-dlp failed, trying link-api as fallback...")
                 try:
+                    # UPDATED: Use the /grab endpoint for a direct link if possible
                     link_api_url = await fetch_link_api(url)
                     if link_api_url:
                         Config.LOGGER.info(f"link-api resolved URL (fallback 2): {link_api_url[:80]}...")
+                        # Recurse with the resolved direct URL
                         return await download_url(
                             link_api_url, filename, progress_msg, start_time_ref, user_id, 
                             format_id=format_id, cancel_ref=cancel_ref
