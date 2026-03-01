@@ -1,15 +1,22 @@
 import os
 import asyncio
 import time
-from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
-from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
-from fastapi.staticfiles import StaticFiles
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from plugins.config import Config
-from utils.shared import WEBAPP_PROGRESS
+from utils.shared import WEBAPP_PROGRESS, bot_client
 
 # Initialize FastAPI
 app = FastAPI(title="URL Uploader API")
+
+# Add CORS Middleware for Telegram WebApp compatibility
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # Mount the static files from 'web' folder
 app.mount("/web", StaticFiles(directory="web"), name="web")
@@ -98,21 +105,12 @@ async def api_formats(req: FormatsRequest):
     from plugins.helper.upload import fetch_ytdlp_formats
     
     try:
-        # FastAPI is async, so we can just await the coroutine directly if it's thread-safe
-        # or run it on the bot's loop if it needs to interact with Pyrogram client safely.
-        # Since fetch_ytdlp_formats is async and uses aiohttp, we just await it.
-        # However, if it touches the bot client, we might need run_coroutine_threadsafe.
-        # Let's use the bot_loop if available for consistency with the old app.py logic
-        if app.bot_loop:
-            future = asyncio.run_coroutine_threadsafe(fetch_ytdlp_formats(url), app.bot_loop)
-            # We await the future in a thread-safe way
-            loop = asyncio.get_event_loop()
-            res = await loop.run_in_executor(None, future.result, 60)
-            return res
-        else:
-            res = await fetch_ytdlp_formats(url)
-            return res
+        # fetch_ytdlp_formats is async and IO-bound (using executor internally for yt-dlp)
+        # We can await it directly. No need for run_coroutine_threadsafe unless we touch bot client.
+        res = await fetch_ytdlp_formats(url)
+        return res
     except Exception as e:
+        Config.LOGGER.exception(f"API Formats Error for {url}")
         raise HTTPException(status_code=500, detail=str(e))
 
 class DownloadRequest(BaseModel):

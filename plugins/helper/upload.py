@@ -707,8 +707,8 @@ async def fetch_ytdlp_formats(url: str) -> dict:
 
     res = await loop.run_in_executor(None, _fetch)
     
-    # SECONDARY FALLBACK: If local yt-dlp format extraction failed, try external API
-    if (not res or not res.get("formats")) and Config.LINK_API_URL:
+    # SECONDARY FALLBACK: If local yt-dlp format extraction failed, try internal engine
+    if (not res or not res.get("formats")):
         Config.LOGGER.info(f"Fallback format extraction via link-api for: {url}")
         info = await external_extract_ytdlp(url)
         if info:

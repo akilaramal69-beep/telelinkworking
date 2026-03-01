@@ -22,7 +22,7 @@ def run_health_server():
     from app import app as api_app
     import uvicorn
     print("🌍 Starting FastAPI health & progress server with Uvicorn (Production)...")
-    uvicorn.run(api_app, host="0.0.0.0", port=8080, log_level="warning")
+    uvicorn.run(api_app, host="0.0.0.0", port=8080, log_level="info")
 
 def setup_bgutil():
     """Downloads and extracts the bgutil-pot rust server binary if missing."""
