@@ -1,32 +1,58 @@
+# Use Python 3.11 Slim as base
 FROM python:3.11-slim
 
-# Install system dependencies
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends \
+# Install system dependencies for FFmpeg, Aria2, and Playwright Chromium
+RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     aria2 \
     git \
     gcc \
+    curl \
     python3-dev \
+    # Chromium system deps for Playwright
+    libnss3 \
+    libatk1.0-0 \
+    libatk-bridge2.0-0 \
+    libcups2 \
+    libdrm2 \
+    libdbus-1-3 \
+    libxkbcommon0 \
+    libxcomposite1 \
+    libxdamage1 \
+    libxfixes3 \
+    libxrandr2 \
+    libgbm1 \
+    libasound2 \
+    libpango-1.0-0 \
+    libpangocairo-1.0-0 \
+    fonts-liberation \
+    xvfb \
+    # Node.js for the PO Token server
+    && curl -sL https://deb.nodesource.com/setup_18.x | bash - \
+    && apt-get install -y nodejs \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-# Install Python dependencies first (cached layer)
+# Install Python dependencies
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
+
+# Install Playwright Chromium browser
+RUN python3 -m playwright install chromium
 
 # Copy project files
 COPY . .
 
-# Create downloads directory
+# Ensure DOWNLOADS directory exists
 RUN mkdir -p DOWNLOADS
 
-# Set ffmpeg path explicitly so yt-dlp always finds it
+# Set environment variables
 ENV FFMPEG_PATH=/usr/bin/ffmpeg
+ENV PYTHONUNBUFFERED=1
 
-# Koyeb expects a web service to listen on port 8080
+# Koyeb expects a web service on port 8080
 EXPOSE 8080
 
-# Start the bot (Flask health server runs in a background thread inside bot.py)
+# Start everything via bot.py (which handles uvicorn and background services)
 CMD ["python3", "bot.py"]
