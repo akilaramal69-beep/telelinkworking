@@ -1,22 +1,29 @@
 import os
 import asyncio
-from flask import Flask, request, jsonify, send_from_directory
-from plugins.config import Config
 import time
+from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
+from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
+from plugins.config import Config
+from utils.shared import WEBAPP_PROGRESS
 
-# Serve the MiniApp directly from the new `web/` folder
-app = Flask(__name__, static_folder="web")
+# Initialize FastAPI
+app = FastAPI(title="URL Uploader API")
 
-# Runtime flags used by bot.py
+# Mount the static files from 'web' folder
+app.mount("/web", StaticFiles(directory="web"), name="web")
+
+# Runtime flags
 app.is_ready = False
 app.is_shutting_down = False
+app.bot_loop = None
 
-# Global cache for the optimized HTML to save Disk I/O
+# Global cache for index.html
 _INDEX_HTML_CACHE = None
 
 async def prune_progress_task():
     """Background task to keep memory low by pruning old progress data."""
-    from utils.shared import WEBAPP_PROGRESS
     while True:
         try:
             now = time.time()
@@ -29,13 +36,13 @@ async def prune_progress_task():
             pass
         await asyncio.sleep(600) # Check every 10 mins
 
-@app.route("/")
-def index():
+@app.get("/", response_class=HTMLResponse)
+async def index():
     global _INDEX_HTML_CACHE
     if app.is_shutting_down:
-        return "🔄 Bot is shutting down…", 503
+        raise HTTPException(status_code=503, detail="🔄 Bot is shutting down…")
     if not app.is_ready:
-        return "⏳ Bot is starting…", 503
+        raise HTTPException(status_code=503, detail="⏳ Bot is starting…")
 
     if _INDEX_HTML_CACHE:
         return _INDEX_HTML_CACHE
@@ -43,151 +50,183 @@ def index():
     try:
         html_path = os.path.join("web", "index.html")
         if not os.path.exists(html_path):
-            return "404 - Web assets missing", 404
+            raise HTTPException(status_code=404, detail="404 - Web assets missing")
             
         with open(html_path, "r", encoding="utf-8") as f:
             content = f.read()
-            # Inject Block ID directly into HTML to save an API request
+            # Inject Block ID directly into HTML
             content = content.replace("{{ADSGRAM_BLOCK_ID}}", Config.ADSGRAM_BLOCK_ID)
             _INDEX_HTML_CACHE = content
             return content
     except Exception as e:
         Config.LOGGER.error(f"Error serving index: {e}")
-        return "Internal Server Error", 500
+        raise HTTPException(status_code=500, detail="Internal Server Error")
 
-@app.route("/<path:path>")
-def serve_static(path):
-    return send_from_directory("web", path)
+@app.get("/{path:path}")
+async def serve_static(path: str):
+    # Try serving from web directory
+    file_path = os.path.join("web", path)
+    if os.path.exists(file_path) and os.path.isfile(file_path):
+        return FileResponse(file_path)
+    # Default fallback to index for SPA-like behavior if needed, 
+    # but here we just return 404 if not found
+    raise HTTPException(status_code=404)
 
-
-@app.route('/api/config', methods=['GET'])
-def api_config():
+@app.get('/api/config')
+async def api_config():
     """Return public configuration values to the frontend."""
-    return jsonify({
+    return {
         "adsgram_block_id": Config.ADSGRAM_BLOCK_ID
-    }), 200
+    }
 
-@app.route("/api/formats", methods=["POST"])
-def api_formats():
+class FormatsRequest(BaseModel):
+    url: str
+
+@app.post("/api/formats")
+async def api_formats(req: FormatsRequest):
     """Endpoint for MiniApp to extract video qualities without uploading."""
     if not app.is_ready:
-        return {"error": "Bot is not ready"}, 503
+        raise HTTPException(status_code=503, detail="Bot is not ready")
 
-    data = request.json
-    url = data.get("url")
+    url = req.url
     if not url:
-        return {"error": "No URL provided"}, 400
+        raise HTTPException(status_code=400, detail="No URL provided")
 
     if "youtube.com" in url.lower() or "youtu.be" in url.lower():
-        return {"error": "YouTube downloading not allowed."}, 403
+        raise HTTPException(status_code=403, detail="YouTube downloading not allowed.")
 
     from plugins.helper.upload import fetch_ytdlp_formats
     
-    # Needs to spawn in loop since Flask is synchronous here
     try:
-        # We must push this coroutine onto the main Pyrogram loop instead of making a new one
-        future = asyncio.run_coroutine_threadsafe(fetch_ytdlp_formats(url), app.bot_loop)
-        res = future.result(timeout=60)
-        return jsonify(res), 200
+        # FastAPI is async, so we can just await the coroutine directly if it's thread-safe
+        # or run it on the bot's loop if it needs to interact with Pyrogram client safely.
+        # Since fetch_ytdlp_formats is async and uses aiohttp, we just await it.
+        # However, if it touches the bot client, we might need run_coroutine_threadsafe.
+        # Let's use the bot_loop if available for consistency with the old app.py logic
+        if app.bot_loop:
+            future = asyncio.run_coroutine_threadsafe(fetch_ytdlp_formats(url), app.bot_loop)
+            # We await the future in a thread-safe way
+            loop = asyncio.get_event_loop()
+            res = await loop.run_in_executor(None, future.result, 60)
+            return res
+        else:
+            res = await fetch_ytdlp_formats(url)
+            return res
     except Exception as e:
-        return {"error": str(e)}, 500
+        raise HTTPException(status_code=500, detail=str(e))
 
+class DownloadRequest(BaseModel):
+    url: str
+    chat_id: int
+    format_id: str = None
+    mode: str = "media"
+    filename: str = None
 
-@app.route("/api/download", methods=["POST"])
-def api_download():
+@app.post("/api/download")
+async def api_download(req: DownloadRequest):
     """Triggered when user clicks 'Beam to Chat' in the MiniApp"""
     if not app.is_ready:
-        return {"error": "Bot is not ready"}, 503
+        raise HTTPException(status_code=503, detail="Bot is not ready")
 
-    data = request.json
-    url = data.get("url")
-    if not url or not data.get("chat_id"):
-        return {"error": "URL or chat_id missing."}, 400
+    url = req.url
+    if not url or not req.chat_id:
+        raise HTTPException(status_code=400, detail="URL or chat_id missing.")
 
     if "youtube.com" in url.lower() or "youtu.be" in url.lower():
-        return {"error": "YouTube downloading not allowed."}, 403
-
-    chat_id = int(data.get("chat_id"))
-    format_id = data.get("format_id")
-    mode = data.get("mode", "media")
-    filename = data.get("filename")
+        raise HTTPException(status_code=403, detail="YouTube downloading not allowed.")
 
     from plugins.commands import trigger_webapp_download
     
-    # We must quickly queue this task onto Pyrogram's async loop
     try:
-         asyncio.run_coroutine_threadsafe(trigger_webapp_download(chat_id, url, format_id, mode, filename), app.bot_loop)
-         return jsonify({"status": "queued"}), 200
+        if app.bot_loop:
+            asyncio.run_coroutine_threadsafe(
+                trigger_webapp_download(req.chat_id, url, req.format_id, req.mode, req.filename), 
+                app.bot_loop
+            )
+        else:
+            # Fallback if loop isn't captured yet
+            asyncio.create_task(trigger_webapp_download(req.chat_id, url, req.format_id, req.mode, req.filename))
+        return {"status": "queued"}
     except Exception as e:
-         return {"error": str(e)}, 500
+        raise HTTPException(status_code=500, detail=str(e))
 
-@app.route("/api/cancel", methods=["POST"])
-def api_cancel():
+class CancelRequest(BaseModel):
+    user_id: int
+
+@app.post("/api/cancel")
+async def api_cancel(req: CancelRequest):
     if not app.is_ready:
-        return {"error": "Bot is not ready"}, 503
+        raise HTTPException(status_code=503, detail="Bot is not ready")
 
-    data = request.json
-    user_id = data.get("user_id")
-    if not user_id:
-        return {"error": "user_id missing."}, 400
-
-    user_id = int(user_id)
+    user_id = req.user_id
     from plugins.commands import ACTIVE_TASKS
     task_info = ACTIVE_TASKS.get(user_id)
     if not task_info:
-        return {"error": "No active process to cancel."}, 404
+        raise HTTPException(status_code=404, detail="No active process to cancel.")
 
     task, cancel_ref = task_info
     cancel_ref[0] = True
     
-    # Safely cancel the task on the bot's async loop
-    app.bot_loop.call_soon_threadsafe(task.cancel)
+    if app.bot_loop:
+        app.bot_loop.call_soon_threadsafe(task.cancel)
+    else:
+        task.cancel()
 
-    return jsonify({"status": "cancelled"}), 200
+    return {"status": "cancelled"}
 
-@app.route("/api/progress", methods=["GET"])
-def api_progress():
+@app.get("/api/progress")
+async def api_progress(user_id: int):
     """Endpoint for MiniApp to poll live download/upload progress."""
     if not app.is_ready:
-        return {"error": "Bot is not ready"}, 503
+        raise HTTPException(status_code=503, detail="Bot is not ready")
 
-    user_id_str = request.args.get("user_id")
-    if not user_id_str or not user_id_str.isdigit():
-        return {"error": "Invalid user_id."}, 400
-
-    user_id = int(user_id_str)
-    from plugins.config import Config
-    from utils.shared import WEBAPP_PROGRESS
-    
     progress_data = WEBAPP_PROGRESS.get(user_id)
-    # Safe logging
-    Config.LOGGER.info(f"Progress request for {user_id}: SyncID={id(WEBAPP_PROGRESS)}, Found={bool(progress_data)}")
     
     if progress_data:
-        return jsonify(progress_data), 200
+        return progress_data
     else:
-        return jsonify({"action": "idle", "percentage": 0}), 200
+        return {"action": "idle", "percentage": 0}
 
-@app.route("/api/debug_state")
-def api_debug_state():
-    from utils.shared import WEBAPP_PROGRESS
-    import sys
-    res = {
-        "sync_id": id(WEBAPP_PROGRESS),
-        "keys": list(WEBAPP_PROGRESS.keys()),
-        "data": WEBAPP_PROGRESS,
-        "python_path": sys.path
-    }
-    return jsonify(res), 200
+# ── Sniffer API Compatibility (link-api) ──────────────────────────────────────
 
-@app.route("/health")
-def health():
+@app.get("/grab")
+async def grab_get(
+    url: str,
+    use_browser: bool = True,
+    timeout: int = 25
+):
+    """Link-API compatibility endpoint for sniffing links."""
+    try:
+        from plugins.helper.extractor import extract_links
+        result = await extract_links(url, use_browser=use_browser, timeout=timeout)
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.post("/extract")
+async def extract_post(request: Request):
+    """Legacy yt-dlp extraction compatibility endpoint."""
+    try:
+        data = await request.json()
+        url = data.get("url")
+        if not url:
+            return {"error": "Missing 'url' in JSON body", "formats": []}
+            
+        from plugins.helper.extractor import extract_raw_ytdlp
+        result = await extract_raw_ytdlp(url)
+        return result
+    except Exception as e:
+        return {"error": str(e), "formats": [], "title": "Extraction Failed"}
+
+@app.get("/health")
+async def health():
     if app.is_shutting_down:
-        return {"status": "shutting_down"}, 503
+        raise HTTPException(status_code=503, detail="shutting_down")
     if not app.is_ready:
-        return {"status": "starting"}, 503
-    return {"status": "ok"}, 200
+        raise HTTPException(status_code=503, detail="starting")
+    return {"status": "ok"}
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8080)
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8080)

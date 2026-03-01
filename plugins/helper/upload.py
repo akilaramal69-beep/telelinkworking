@@ -263,63 +263,38 @@ def is_cobalt_url(url: str) -> bool:
 
 async def fetch_link_api(url: str) -> str | None:
     """
-    Call the link-api GET /grab endpoint to extract a direct download URL.
-    Uses headless Chromium (Playwright) + yt-dlp server-side.
+    Call the internal extraction logic (formerly link-api) to extract a direct download URL.
+    Uses headless Chromium (Playwright) + yt-dlp.
 
-    Returns the best direct URL string, or None if unavailable / API is not configured.
+    Returns the best direct URL string, or None if unavailable.
     """
-    if not Config.LINK_API_URL:
-        return None
-
-    # Use GET with query params — simpler than POST and avoids any body encoding issues
-    params = {"url": url, "use_browser": "true", "timeout": "30"}
-    api_url = Config.LINK_API_URL.rstrip("/") + "/grab"
-    session = await get_http_session()
+    from .extractor import extract_links
+    Config.LOGGER.info(f"Using internal extraction engine for: {url}")
     try:
-        async with session.get(
-            api_url,
-            params=params,
-            timeout=aiohttp.ClientTimeout(total=50),  # Playwright render can be slow
-        ) as resp:
-            if resp.status != 200:
-                # Log the detail body so we know WHY it failed
-                try:
-                    err_body = await resp.json()
-                    detail = err_body.get("detail", resp.reason)
-                except Exception:
-                    detail = await resp.text()
-                Config.LOGGER.warning(
-                    f"link-api returned HTTP {resp.status} for {url}: {detail}"
-                )
-                return None
+        # Use a timeout of 45 seconds for the internal sniffer
+        result = await extract_links(url, use_browser=True, timeout=45)
+        best = result.get("best_link")
+        if best:
+            Config.LOGGER.info(f"Internal extraction found best_link: {best[:80]}")
+            return best
+        
+        links = result.get("links", [])
+        if not links:
+            Config.LOGGER.warning(f"Internal extraction returned 0 links for {url}")
+            return None
+            
+        def _score(link: dict) -> tuple:
+            has_av = link.get("has_video", False) and link.get("has_audio", False)
+            is_mp4 = link.get("stream_type", "") == "mp4"
+            height = link.get("height") or 0
+            return (has_av, is_mp4, height)
 
-            data = await resp.json()
-
-            # Prefer best_link from the API recommendation
-            best = data.get("best_link")
-            if best:
-                Config.LOGGER.info(f"link-api best_link: {best[:80]}")
-                return best
-
-            # If no best_link, pick from links[] — prefer MP4 with audio+video at highest resolution
-            links = data.get("links", [])
-            if not links:
-                Config.LOGGER.warning(f"link-api returned 0 links for {url}")
-                return None
-
-            def _score(link: dict) -> tuple:
-                has_av = link.get("has_video", False) and link.get("has_audio", False)
-                is_mp4 = link.get("stream_type", "") == "mp4"
-                height = link.get("height") or 0
-                return (has_av, is_mp4, height)
-
-            links_sorted = sorted(links, key=_score, reverse=True)
-            chosen = links_sorted[0].get("url")
-            Config.LOGGER.info(f"link-api chose: {str(chosen)[:80]}")
-            return chosen
-
+        links_sorted = sorted(links, key=_score, reverse=True)
+        chosen = links_sorted[0].get("url")
+        Config.LOGGER.info(f"Internal extraction chose: {str(chosen)[:80]}")
+        return chosen
     except Exception as e:
-        Config.LOGGER.warning(f"link-api fetch failed for {url}: {e}")
+        Config.LOGGER.warning(f"Internal extraction failed for {url}: {e}")
         return None
 
 
@@ -340,30 +315,17 @@ async def _safe_edit(msg, text: str, reply_markup=None):
 
 async def external_extract_ytdlp(url: str) -> dict | None:
     """
-    Call the external Koyeb API for raw yt-dlp metadata extraction.
-    Used as a fallback when local yt-dlp is blocked or fails.
+    Call the internal extraction logic for raw yt-dlp metadata.
+    Used as a fallback when local native yt-dlp is blocked or fails.
     """
-    if not Config.LINK_API_URL:
-        return None
-    
-    api_url = f"{Config.LINK_API_URL.rstrip('/')}/extract"
+    from .extractor import extract_raw_ytdlp
+    Config.LOGGER.info(f"Using internal raw extractor for: {url}")
     try:
-        session = await get_http_session()
-        # High timeout (120s) because the external API uses WARP + Cold Boot
-        async with session.post(api_url, json={"url": url}, timeout=120) as resp:
-            if resp.status == 200:
-                data = await resp.json()
-                if "error" in data and not data.get("formats") and not data.get("entries"):
-                    Config.LOGGER.error(f"External yt-dlp API returned error: {data['error']}")
-                    return None
-                
-                # If it's a playlist, return it as is or resolve to first entry if caller expects single video
-                Config.LOGGER.info(f"Successfully extracted metadata via external yt-dlp API: {url}")
-                return data
-            else:
-                Config.LOGGER.error(f"External yt-dlp API failed with status {resp.status}")
+        data = await extract_raw_ytdlp(url)
+        if data and (data.get("formats") or data.get("entries")):
+            return data
     except Exception as e:
-        Config.LOGGER.error(f"External yt-dlp API exception: {e}")
+        Config.LOGGER.error(f"Internal raw extraction failed for {url}: {e}")
     return None
 
 
