@@ -353,9 +353,11 @@ async def external_extract_ytdlp(url: str) -> dict | None:
         async with session.post(api_url, json={"url": url}, timeout=120) as resp:
             if resp.status == 200:
                 data = await resp.json()
-                if "error" in data and not data.get("formats"):
+                if "error" in data and not data.get("formats") and not data.get("entries"):
                     Config.LOGGER.error(f"External yt-dlp API returned error: {data['error']}")
                     return None
+                
+                # If it's a playlist, return it as is or resolve to first entry if caller expects single video
                 Config.LOGGER.info(f"Successfully extracted metadata via external yt-dlp API: {url}")
                 return data
             else:
@@ -378,6 +380,11 @@ async def fetch_ytdlp_title(url: str) -> str | None:
         Config.LOGGER.info(f"Primary YouTube title extraction via external API: {url}")
         info = await external_extract_ytdlp(url)
         if info:
+            # Handle Playlists: If info has 'entries', take the first one
+            if "entries" in info and info["entries"]:
+                info = info["entries"][0]
+                Config.LOGGER.info(f"Detected playlist, resolving to first entry: {info.get('title')}")
+
             title = info.get("title") or info.get("id") or "video"
             title = re.sub(r'[\\/*?"<>|:\n\r\t]', "_", title).strip()
             ext = info.get("ext") or "mp4"
@@ -410,6 +417,12 @@ async def fetch_ytdlp_title(url: str) -> str | None:
 
             with yt_dlp.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(url, download=False)
+                
+                # Handle Playlists: If info has 'entries', take the first one
+                if "entries" in info and info["entries"]:
+                    info = info["entries"][0]
+                    Config.LOGGER.info(f"Detected playlist, resolving to first entry: {info.get('title')}")
+
                 title = info.get("title") or info.get("id") or "video"
                 title = re.sub(r'[\\/*?"<>|:\n\r\t]', "_", title).strip()
                 ext = info.get("ext") or "mp4"
@@ -501,6 +514,11 @@ async def fetch_ytdlp_formats(url: str) -> dict:
         Config.LOGGER.info(f"Primary YouTube format extraction via external API: {url}")
         info = await external_extract_ytdlp(url)
         if info:
+            # Handle Playlists: If info has 'entries', take the first one
+            if "entries" in info and info["entries"]:
+                info = info["entries"][0]
+                Config.LOGGER.info(f"Detected playlist in format extraction, resolving to first entry: {info.get('title')}")
+
             formats = info.get("formats", [])
             title = info.get("title", "video")
 
@@ -600,6 +618,12 @@ async def fetch_ytdlp_formats(url: str) -> dict:
 
             with yt_dlp.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(url, download=False)
+                
+                # Handle Playlists: If info has 'entries', take the first one
+                if "entries" in info and info["entries"]:
+                    info = info["entries"][0]
+                    Config.LOGGER.info(f"Detected playlist in format extraction, resolving to first entry: {info.get('title')}")
+
                 formats = info.get("formats", [])
                 title = info.get("title", "video")
                 
