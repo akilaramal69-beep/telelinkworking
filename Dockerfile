@@ -34,12 +34,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-# Install Python dependencies
+# Ensure pip is up to date and use it to install requirements
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN python3 -m pip install --upgrade pip && \
+    python3 -m pip install --no-cache-dir -r requirements.txt
 
-# Install Playwright Chromium browser
-RUN python3 -m playwright install chromium
+# 1DM Hardening: Explicitly install playwright again and then Chromium
+# Use python3 -m to be absolutely certain we are in the same environment
+RUN python3 -m pip install playwright && \
+    python3 -m playwright install chromium
 
 # Copy project files
 COPY . .
@@ -54,5 +57,5 @@ ENV PYTHONUNBUFFERED=1
 # Koyeb expects a web service on port 8080
 EXPOSE 8080
 
-# Start everything via bot.py (which handles uvicorn and background services)
+# Start everything via bot.py
 CMD ["python3", "bot.py"]
