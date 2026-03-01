@@ -313,6 +313,46 @@ async def _safe_edit(msg, text: str, reply_markup=None):
         pass
 
 
+async def fetch_link_api(url: str) -> str | None:
+    """
+    Call the internal extraction logic (formerly link-api) to extract a direct download URL.
+    Uses headless Chromium (Playwright) + yt-dlp.
+
+    Returns the best direct URL string, or None if unavailable.
+    """
+    from .extractor import extract_links
+    Config.LOGGER.info(f"Using internal extraction engine for: {url}")
+    try:
+        # Use a timeout of 45 seconds for the internal sniffer
+        result = await extract_links(url, use_browser=True, timeout=45)
+        best = result.get("best_link")
+        if best:
+            return best
+        
+        # If internal fails, try the working external API fallback as a last resort
+        return await fetch_external_api(url)
+    except Exception as e:
+        Config.LOGGER.error(f"Internal extraction engine failed: {e}")
+        return await fetch_external_api(url)
+
+async def fetch_external_api(url: str) -> str | None:
+    """
+    Call the working external API (link-api) as a fallback.
+    """
+    api_url = Config.LINK_API_URL or "https://native-serene-maduranga11-43790d26.koyeb.app"
+    api_url = f"{api_url.rstrip('/')}/grab"
+    
+    Config.LOGGER.info(f"Trying external fallback API for: {url}")
+    try:
+        session = await get_http_session()
+        async with session.get(api_url, params={"url": url}, timeout=60) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                return data.get("best_link")
+    except Exception as e:
+        Config.LOGGER.error(f"External fallback API failed: {e}")
+    return None
+
 async def external_extract_ytdlp(url: str) -> dict | None:
     """
     Call the internal extraction logic for raw yt-dlp metadata.
@@ -326,6 +366,18 @@ async def external_extract_ytdlp(url: str) -> dict | None:
             return data
     except Exception as e:
         Config.LOGGER.error(f"Internal raw extraction failed for {url}: {e}")
+        
+    # If internal extraction failed, try the external /extract endpoint
+    api_url = Config.LINK_API_URL or "https://native-serene-maduranga11-43790d26.koyeb.app"
+    api_url = f"{api_url.rstrip('/')}/extract"
+    try:
+        session = await get_http_session()
+        async with session.post(api_url, json={"url": url}, timeout=60) as resp:
+            if resp.status == 200:
+                return await resp.json()
+    except Exception:
+        pass
+        
     return None
 
 
