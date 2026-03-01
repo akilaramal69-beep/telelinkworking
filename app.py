@@ -197,12 +197,52 @@ async def link_api_info():
     return {
         "message": "Direct Link Grabber API (integrated) — IDM-style",
         "endpoints": {
-            "GET /grab?url=<URL>": "Grab links from any video URL",
-            "POST /grab": '{"url": "...", "use_browser": true, "timeout": 25}',
-            "POST /extract": '{"url": "..."} — yt-dlp compatible formats',
+            "GET /api/grab?url=<URL>": "Grab direct links (webapp)",
+            "POST /api/extract": '{"url": "..."} — yt-dlp formats (webapp)',
+            "GET /grab?url=<URL>": "Grab links (external API)",
+            "POST /extract": "Legacy yt-dlp extraction",
             "GET /health": "API status check",
         },
     }
+
+
+@app.get("/api/grab")
+async def api_grab(
+    url: str = Query(..., description="Video page URL"),
+    use_browser: bool = Query(True, description="Use browser extraction"),
+    timeout: int = Query(45, description="Timeout in seconds"),
+):
+    """Webapp-native: Extract direct media links from video page URLs."""
+    if not app.is_ready:
+        raise HTTPException(status_code=503, detail="Bot is not ready")
+    if not url:
+        raise HTTPException(status_code=400, detail="No URL provided")
+    if "youtube.com" in url.lower() or "youtu.be" in url.lower():
+        raise HTTPException(status_code=403, detail="YouTube downloading not allowed.")
+    try:
+        from plugins.helper.extractor import extract_links
+        result = await extract_links(url, use_browser=use_browser, timeout=timeout)
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post("/api/extract")
+async def api_extract(req: FormatsRequest):
+    """Webapp-native: Extract yt-dlp compatible formats (for video pages that return HTML)."""
+    if not app.is_ready:
+        raise HTTPException(status_code=503, detail="Bot is not ready")
+    url = req.url
+    if not url:
+        raise HTTPException(status_code=400, detail="No URL provided")
+    if "youtube.com" in url.lower() or "youtu.be" in url.lower():
+        raise HTTPException(status_code=403, detail="YouTube downloading not allowed.")
+    try:
+        from plugins.helper.extractor import extract_raw_ytdlp
+        result = await extract_raw_ytdlp(url)
+        return result
+    except Exception as e:
+        return {"error": str(e), "formats": [], "title": "Extraction Failed"}
 
 
 class LinkRequest(BaseModel):

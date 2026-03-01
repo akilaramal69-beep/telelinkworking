@@ -261,6 +261,23 @@ def is_cobalt_url(url: str) -> bool:
         return False
 
 
+def is_likely_video_page(url: str) -> bool:
+    """Return True if URL looks like a video page (not a direct media file).
+    Such URLs return HTML and need link-api extraction first."""
+    try:
+        path = urllib.parse.urlparse(url).path.lower().split("?")[0]
+        # Direct media: path ends with known extensions
+        direct_extensions = (".mp4", ".m3u8", ".mpd", ".webm", ".mkv", ".m4v", ".ts", ".flv", ".avi", ".mov")
+        if any(path.endswith(ext) for ext in direct_extensions):
+            return False
+        # Also check for remote_control.php etc. (direct media scripts)
+        if "remote_control.php" in url.lower() or "/get_file/" in url.lower():
+            return False
+        return True  # Likely a page
+    except Exception:
+        return True
+
+
 async def fetch_link_api(url: str) -> str | None:
     """
     Call the internal extraction logic (formerly link-api) to extract a direct download URL.
@@ -1465,6 +1482,24 @@ async def download_url(url: str, filename: str, progress_msg, start_time_ref: li
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.5"
     }
+
+    # ── PRIORITY: Unknown video page URLs (return HTML) → use link-api first ─────
+    # Prevents downloading HTML when user sends a video page URL that yt-dlp/cobalt don't handle
+    if is_likely_video_page(url) and not is_ytdlp_url(url) and not is_cobalt_url(url):
+        try:
+            await progress_msg.edit_text(
+                "📥 **Resolving video link…**\n_(using extraction engine…)_",
+                reply_markup=cancel_button(user_id)
+            )
+        except Exception:
+            pass
+        link_api_url = await fetch_link_api(url)
+        if link_api_url and link_api_url != url:
+            Config.LOGGER.info(f"Link-API resolved page to direct URL: {link_api_url[:80]}...")
+            return await download_url(
+                link_api_url, filename, progress_msg, start_time_ref, user_id,
+                format_id=format_id, cancel_ref=cancel_ref
+            )
 
     # ── Route yt-dlp-supported platforms ─────────────────────────────────────
     if is_ytdlp_url(url):
