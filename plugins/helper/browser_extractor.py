@@ -286,7 +286,7 @@ async def intercept_browser(url: str, timeout_ms: int = 25000) -> list[dict]:
                             });
                             // Also search the entire page text for M3U8 links as a hail-mary
                             const pageText = document.documentElement.innerHTML;
-                            const matches = pageText.match(/https?:\\?\\?\/\\?\\?\/[^"']+\.(m3u8|mp4|m3u8|mpd)/g);
+                            const matches = pageText.match(/https?:\\?\\?\/\\?\\?\/[^"']+\.(m3u8|mp4|mpd)/g);
                             if (matches) matches.forEach(m => urls.add(m.replace(/\\\\/g, '')));
 
                             return Array.from(urls).filter(u => u.startsWith('http'));

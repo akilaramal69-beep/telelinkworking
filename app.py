@@ -1,7 +1,7 @@
 import os
 import asyncio
 import time
-from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
+from fastapi import FastAPI, Request, HTTPException, BackgroundTasks, Query
 from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
@@ -189,20 +189,66 @@ async def api_progress(user_id: int):
         return {"action": "idle", "percentage": 0}
 
 # ── Sniffer API Compatibility (link-api) ──────────────────────────────────────
+# See: https://github.com/akilaramal69-beep/link-api
+
+@app.get("/api/link")
+async def link_api_info():
+    """Link-API discovery — returns available endpoints."""
+    return {
+        "message": "Direct Link Grabber API (integrated) — IDM-style",
+        "endpoints": {
+            "GET /grab?url=<URL>": "Grab links from any video URL",
+            "POST /grab": '{"url": "...", "use_browser": true, "timeout": 25}',
+            "POST /extract": '{"url": "..."} — yt-dlp compatible formats',
+            "GET /health": "API status check",
+        },
+    }
+
+
+class LinkRequest(BaseModel):
+    """Request body for POST /grab — link-api compatibility."""
+    url: str
+    use_browser: bool = True  # False = force yt-dlp only
+    timeout: int = 25  # seconds
+
 
 @app.get("/grab")
 async def grab_get(
-    url: str,
-    use_browser: bool = True,
-    timeout: int = 25
+    url: str = Query(..., description="Any video page URL"),
+    use_browser: bool = Query(True, description="Use headless browser interception"),
+    timeout: int = Query(25, description="Timeout in seconds"),
 ):
-    """Link-API compatibility endpoint for sniffing links."""
+    """Extract direct media links from any video URL (link-api compatible)."""
     try:
         from plugins.helper.extractor import extract_links
         result = await extract_links(url, use_browser=use_browser, timeout=timeout)
+        if not result.get("links"):
+            raise HTTPException(status_code=400, detail=f"No media links found for: {url}")
         return result
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(status_code=400, detail=f"Extraction error: {str(e)}")
+
+
+@app.post("/grab")
+async def grab_post(req: LinkRequest):
+    """Extract direct media links from any video URL (POST — link-api compatible)."""
+    try:
+        from plugins.helper.extractor import extract_links
+        result = await extract_links(
+            req.url,
+            use_browser=req.use_browser,
+            timeout=req.timeout,
+        )
+        if not result.get("links"):
+            raise HTTPException(status_code=400, detail=f"No media links found for: {req.url}")
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Extraction error: {str(e)}")
+
 
 @app.post("/extract")
 async def extract_post(request: Request):
@@ -219,8 +265,9 @@ async def extract_post(request: Request):
     except Exception as e:
         return {"error": str(e), "formats": [], "title": "Extraction Failed"}
 
-@app.get("/health")
+@app.api_route("/health", methods=["GET", "HEAD"])
 async def health():
+    """Health check — supports GET and HEAD (Koyeb probe)."""
     if app.is_shutting_down:
         raise HTTPException(status_code=503, detail="shutting_down")
     if not app.is_ready:
