@@ -34,15 +34,38 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-# Ensure pip is up to date and use it to install requirements
-COPY requirements.txt .
-RUN python3 -m pip install --upgrade pip && \
-    python3 -m pip install --no-cache-dir -r requirements.txt
+# Ensure pip is up to date
+RUN python3 -m pip install --upgrade pip
 
-# 1DM Hardening: Explicitly install playwright again and then Chromium
-# Use python3 -m to be absolutely certain we are in the same environment
-RUN python3 -m pip install playwright && \
-    python3 -m playwright install chromium
+# HARDENED INSTALLATION: Bypassing requirements.txt to avoid any encoding/caching issues
+# Installing directly in the Docker layer
+RUN python3 -m pip install --no-cache-dir \
+    fastapi \
+    uvicorn \
+    playwright \
+    httpx \
+    python-multipart \
+    pyroblack \
+    tgcrypto \
+    aiohttp==3.9.5 \
+    aiofiles==23.2.1 \
+    motor==3.4.0 \
+    pymongo==4.7.3 \
+    dnspython==2.6.1 \
+    flask==3.0.3 \
+    gunicorn==22.0.0 \
+    psutil==5.9.8 \
+    filetype==1.2.0 \
+    Pillow==10.3.0 \
+    requests==2.32.3 \
+    yt-dlp \
+    bgutil-ytdlp-pot-provider \
+    python-dotenv==1.0.1 \
+    aria2p \
+    waitress==3.0.0
+
+# Install Playwright Chromium browser
+RUN python3 -m playwright install chromium
 
 # Copy project files
 COPY . .
