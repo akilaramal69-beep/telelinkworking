@@ -79,7 +79,7 @@ Copy `.env.example` to `.env` and fill in:
 | `API_ID` | From [my.telegram.org](https://my.telegram.org) |
 | `API_HASH` | From [my.telegram.org](https://my.telegram.org) |
 | `OWNER_ID` | Your Telegram user ID |
-| `DATABASE_URL` | MongoDB Atlas connection string |
+| `DATABASE_URL` | MongoDB connection string (Atlas or local) |
 | `LOG_CHANNEL` | Private channel ID for upload logs (negative number) |
 
 ### Optional
@@ -87,21 +87,24 @@ Copy `.env.example` to `.env` and fill in:
 | Variable | Default | Description |
 |---|---|---|
 | `BOT_USERNAME` | `UrlUploaderBot` | Bot username (without @) |
-| `UPDATES_CHANNEL` | _(none)_ | Updates channel username — button shown only if set |
 | `ADMIN` | _(none)_ | Space-separated extra admin user IDs |
+| `BANNED_USERS` | _(none)_ | Space-separated user IDs to block initially |
+| `UPDATES_CHANNEL` | _(none)_ | Updates channel username — button shown only if set |
 | `SESSION_STRING` | _(none)_ | Pyrogram session string for 4 GB uploads (premium account) |
-| `CHUNK_SIZE` | `512` | Download chunk size in KB |
+| `CHUNK_SIZE` | `10240` | Upload chunk size in KB (10MB default for high speed) |
+| `COOKIES_FILE` | `cookies.txt` | Path to your cookies file |
 
-### Koyeb / Cloud
+### Advanced / Deployment
 
 | Variable | Default | Description |
 |---|---|---|
-| `COOKIES_DATA` | _(none)_ | Paste full `cookies.txt` content here — bot auto-converts `\n` to real newlines on startup |
+| `COOKIES_DATA` | _(none)_ | Paste full `cookies.txt` content for cloud environments |
 | `PROXY` | _(none)_ | Proxy URL: `http://user:pass@host:port` or `socks5://...` |
-| `FFMPEG_PATH` | `/usr/bin/ffmpeg` | Path to ffmpeg binary (Docker-ready) |
-| `COBALT_API_URL` | `https://permanent-coral-akila-5...` | Cobalt API endpoint for fallback |
-| `ALLOW_BOT_URL_UPLOAD` | `True` | Set to `False` to force users to use the Mini App interface |
-| `ADSGRAM_BLOCK_ID` | `int-23574` | Customizable Adsgram Block ID for Mini App monetization |
+| `FFMPEG_PATH` | `ffmpeg` | Path to FFmpeg executable |
+| `COBALT_API_URL` | `https://arrogant-karrah...` | Cobalt API endpoint for fallback |
+| `LINK_API_URL` | `https://native-serene...` | Link Grabber API endpoint (Headless + Extractions) |
+| `ALLOW_BOT_URL_UPLOAD` | `True` | Allow bot to process URLs directly in chat |
+| `ADSGRAM_BLOCK_ID` | `int-23574` | Adsgram Block ID for Mini App monetization |
 
 ---
 
